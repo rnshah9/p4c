@@ -171,6 +171,14 @@ void DoLocalCopyPropagation::flow_merge(Visitor &a_) {
             var.second.val = nullptr; } }
     need_key_rewrite |= a.need_key_rewrite;
 }
+void DoLocalCopyPropagation::flow_copy(ControlFlowVisitor &a_) {
+    auto &a = dynamic_cast<DoLocalCopyPropagation &>(a_);
+    BUG_CHECK(working == a.working, "inconsitent DoLocalCopyPropagation state on copy");
+    available = a.available;
+    need_key_rewrite = a.need_key_rewrite;
+    BUG_CHECK(inferForTable == a.inferForTable, "inconsitent DoLocalCopyPropagation state on copy");
+    BUG_CHECK(inferForFunc == a.inferForFunc, "inconsitent DoLocalCopyPropagation state on copy");
+}
 
 /// test to see if names denote overlapping locations
 bool DoLocalCopyPropagation::name_overlap(cstring name1, cstring name2) {
