@@ -567,12 +567,15 @@ const IR::Type* TypeInference::canonicalize(const IR::Type* type) {
             auto atype = getTypeType(a);
             if (atype == nullptr)
                 return nullptr;
-            if (atype->is<IR::Type_Control>() ||
-                atype->is<IR::Type_Parser>() ||
-                atype->is<IR::Type_Package>() ||
-                atype->is<IR::P4Parser>() ||
-                atype->is<IR::P4Control>()) {
-                typeError("%1%: Cannot use %2% as a type parameter", type, atype);
+            auto checkType = atype;
+            if (auto tsc = atype->to<IR::Type_SpecializedCanonical>())
+                checkType = tsc->baseType;
+            if (checkType->is<IR::Type_Control>() ||
+                checkType->is<IR::Type_Parser>() ||
+                checkType->is<IR::Type_Package>() ||
+                checkType->is<IR::P4Parser>() ||
+                checkType->is<IR::P4Control>()) {
+                typeError("%1%: Cannot use %2% as a type parameter", type, checkType);
                 return nullptr;
             }
             const IR::Type* canon = canonicalize(atype);
@@ -1014,7 +1017,8 @@ bool TypeInference::checkAbstractMethods(const IR::Declaration_Instance* inst,
                 { func, methtype });
             if (tvs == nullptr)
                 return false;
-            BUG_CHECK(tvs->isIdentity(), "%1%: expected no type variables", tvs);
+            BUG_CHECK(errorCount() > 0 || tvs->isIdentity(),
+                      "%1%: expected no type variables", tvs);
         }
     }
     bool rv = true;
@@ -1188,6 +1192,17 @@ const IR::Node* TypeInference::postorder(IR::Method* method) {
     auto type = getTypeType(method->type);
     if (type == nullptr)
         return method;
+    if (auto mtype = type->to<IR::Type_Method>()) {
+        if (mtype->returnType) {
+            if (auto gen = mtype->returnType->to<IR::IMayBeGenericType>()) {
+                if (gen->getTypeParameters()->size() != 0) {
+                    typeError("%1%: no type parameters supplied for return generic type",
+                              method->type->returnType);
+                    return method;
+                }
+            }
+        }
+    }
     setType(getOriginal(), type);
     setType(method, type);
     return method;
@@ -1418,6 +1433,10 @@ const IR::Node* TypeInference::postorder(IR::Type_Method* type) {
         auto extName = ext->name.name;
         if (auto method = findContext<IR::Method>()) {
             auto name = method->name.name;
+            if (methodType->returnType &&
+                (methodType->returnType->is<IR::Type_InfInt>() ||
+                 methodType->returnType->is<IR::Type_String>()))
+                typeError("%1%: illegal return type for method", method->type->returnType);
             if (name == extName) {
                 // This is a constructor.
                 if (method->type->typeParameters != nullptr &&
@@ -2282,8 +2301,7 @@ const IR::Node* TypeInference::shift(const IR::Operation_Binary* expression) {
         return expression;
     }
     auto lt = ltype->to<IR::Type_Bits>();
-    if (expression->right->is<IR::Constant>()) {
-        auto cst = expression->right->to<IR::Constant>();
+    if (auto cst = expression->right->to<IR::Constant>()) {
         if (!cst->fitsInt()) {
             typeError("Shift amount too large: %1%", cst);
             return expression;
@@ -2296,6 +2314,20 @@ const IR::Node* TypeInference::shift(const IR::Operation_Binary* expression) {
         if (lt != nullptr && shift >= lt->size)
             warn(ErrorType::WARN_OVERFLOW, "%1%: shifting value with %2% bits by %3%",
                  expression, lt->size, shift);
+        // If the amount is signed but positive, make it unsigned
+        if (auto bt = rtype->to<IR::Type_Bits>()) {
+            if (bt->isSigned) {
+                rtype = new IR::Type_Bits(rtype->srcInfo, bt->width_bits(), false);
+                auto amt = new IR::Constant(cst->srcInfo, rtype, cst->value, cst->base);
+                if (expression->is<IR::Shl>()) {
+                    expression = new IR::Shl(expression->srcInfo, expression->left, amt);
+                } else {
+                    expression = new IR::Shr(expression->srcInfo, expression->left, amt);
+                }
+                setCompileTimeConstant(expression->right);
+                setType(expression->right, rtype);
+            }
+        }
     }
 
     if (rtype->is<IR::Type_Bits>() && rtype->to<IR::Type_Bits>()->isSigned) {
@@ -3297,10 +3329,13 @@ const IR::Node* TypeInference::postorder(IR::MethodCallExpression* expression) {
         // Constant-fold constant expressions
         if (auto mem = expression->method->to<IR::Member>()) {
             auto type = typeMap->getType(mem->expr, true);
-            if ((mem->member == IR::Type::minSizeInBits ||
+            if (((mem->member == IR::Type::minSizeInBits ||
                  mem->member == IR::Type::minSizeInBytes ||
                  mem->member == IR::Type::maxSizeInBits ||
-                 mem->member == IR::Type::maxSizeInBytes)) {
+                 mem->member == IR::Type::maxSizeInBytes)) &&
+                !type->is<IR::Type_Extern>() &&
+                expression->typeArguments->size() == 0 &&
+                expression->arguments->size() == 0) {
                 auto max = mem->member.name.startsWith("max");
                 int w = typeMap->widthBits(type, expression, max);
                 LOG3("Folding " << mem << " to " << w);
