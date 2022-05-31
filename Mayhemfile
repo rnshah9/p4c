@@ -1,0 +1,6 @@
+project: rnshah9/p4c
+target: irgenerator
+
+cmds:
+  - cmd: /repo/build/tools/ir-generator/irgenerator @@
+    filepath: /test.def
