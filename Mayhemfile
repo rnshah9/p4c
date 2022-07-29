@@ -2,5 +2,4 @@ project: p4c
 target: irgenerator
 
 cmds:
-  - cmd: /repo/build/tools/ir-generator/irgenerator /test.def
-    filepath: /test.def
+  - cmd: /irgenerator @@
