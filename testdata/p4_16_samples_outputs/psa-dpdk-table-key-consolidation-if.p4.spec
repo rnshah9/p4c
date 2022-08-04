@@ -67,6 +67,8 @@ struct user_meta_t {
 	bit<16> local_metadata_data
 	bit<16> local_metadata_data1
 	bit<48> MyIC_tbl_ethernet_srcAddr
+	bit<16> tmpMask
+	bit<8> tmpMask_0
 }
 metadata instanceof user_meta_t
 
@@ -141,14 +143,17 @@ apply {
 	table tbl
 	jmpnh LABEL_END
 	table foo
-	LABEL_END :	table tbl
+	LABEL_END :	mov m.MyIC_tbl_ethernet_srcAddr h.ethernet.srcAddr
+	table tbl
 	jmpnh LABEL_END_0
 	table foo
-	LABEL_END_0 :	table tbl
+	LABEL_END_0 :	mov m.MyIC_tbl_ethernet_srcAddr h.ethernet.srcAddr
+	table tbl
 	jmpnh LABEL_FALSE_1
 	jmp LABEL_END_1
 	LABEL_FALSE_1 :	table bar
-	LABEL_END_1 :	table tbl
+	LABEL_END_1 :	mov m.MyIC_tbl_ethernet_srcAddr h.ethernet.srcAddr
+	table tbl
 	jmpnh LABEL_FALSE_2
 	jmp LABEL_END_2
 	LABEL_FALSE_2 :	table bar

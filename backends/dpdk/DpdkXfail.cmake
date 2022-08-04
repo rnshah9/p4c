@@ -4,11 +4,6 @@ p4c_add_xfail_reason("dpdk"
   )
 
 p4c_add_xfail_reason("dpdk"
-  "error: Action parameter color has a type which is not bit<>, int<>, bool, type or serializable enum"
-  testdata/p4_16_samples/psa-meter1.p4
-  )
-
-p4c_add_xfail_reason("dpdk"
   "error: Name .* is used for multiple direct counter objects in the P4Info message"
   testdata/p4_16_samples/psa-counter6.p4
   )
@@ -85,11 +80,6 @@ p4c_add_xfail_reason("dpdk"
 p4c_add_xfail_reason("dpdk"
   "No argument supplied for parameter"
   testdata/p4_16_samples/pna-example-mirror-packet-error3.p4
-  )
-
-p4c_add_xfail_reason("dpdk"
-  "declaration not found"
-  testdata/p4_16_samples/pna-direction-main-parser-err.p4
   )
 
 p4c_add_xfail_reason("dpdk"

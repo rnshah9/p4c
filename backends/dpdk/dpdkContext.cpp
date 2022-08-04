@@ -49,6 +49,7 @@ void DpdkContextGenerator::CollectTablesAndSetAttributes() {
                 struct TableAttributes tblAttr;
                 tblAttr.direction = direction;
                 tblAttr.controlName = control->name.originalName;
+                tblAttr.externalName = tbl->controlPlaneName();
                 tblAttr.tableHandle = getNewTableHandle();
                 auto size = tbl->getSizeProperty();
                 tblAttr.size = dpdk_default_table_size;
@@ -108,6 +109,45 @@ void DpdkContextGenerator::CollectTablesAndSetAttributes() {
         }
     }
 
+    for (auto ed :  structure->externDecls) {
+        if (auto type = ed->type->to<IR::Type_Specialized>()) {
+            auto externTypeName = type->baseType->path->name.name;
+            if (externTypeName == "Counter" ||
+                externTypeName == "Register" ||
+                externTypeName == "Meter" ||
+                externTypeName == "Hash" ||
+                externTypeName == "InternetCheckSum") {
+                struct externAttributes externAttr;
+                externAttr.externalName = ed->controlPlaneName();
+                externAttr.externType = externTypeName;
+                if (externTypeName == "Counter") {
+                    if (ed->arguments->size() != 2) {
+                        ::error(ErrorType::ERR_UNEXPECTED,
+                                "%1%: expected 2 arguments, number of counters and type"
+                                "of counter", ed);
+                    }
+                    auto counter_type = ed->arguments->at(1)->expression;
+                    BUG_CHECK(counter_type->is<IR::Constant>(),
+                               "Expected counter type to be constant");
+                    auto value = counter_type->to<IR::Constant>()->asUnsigned();
+                    switch (value) {
+                        case 0:
+                            externAttr.counterType = "packets";
+                            break;
+                        case 1:
+                             externAttr.counterType = "bytes";
+                            break;
+                        case 2:
+                             externAttr.counterType = "packets_and_bytes";
+                            break;
+                    }
+                }
+                externAttrMap.emplace(ed->name.name, externAttr);
+                externs.push_back(ed);
+            }
+        }
+    }
+
     // Keep the compiler generated (hidden) tables at the end
     for (auto d : selector_tables)
         tables.push_back(d);
@@ -139,7 +179,8 @@ Util::JsonObject* DpdkContextGenerator::initTableCommonJson(
     const cstring name, const struct TableAttributes & attr) {
     auto* tableJson = new Util::JsonObject();
     cstring tableName = attr.controlName + "." + name;
-    tableJson->emplace("name", tableName);
+    tableJson->emplace("name", attr.externalName);
+    tableJson->emplace("target_name", tableName);
     tableJson->emplace("direction", attr.direction);
     tableJson->emplace("handle", attr.tableHandle);
     tableJson->emplace("table_type", attr.tableType);
@@ -212,6 +253,7 @@ void DpdkContextGenerator::setActionAttributes(const IR::P4Table *tbl) {
         attr.allowed_as_hit_action = can_be_hit_action;
         attr.allowed_as_default_action = can_be_default_action;
         attr.actionHandle = getNewActionHandle();
+        attr.externalName = action_decl->controlPlaneName();
         actionAttrMap.emplace(act->getName(), attr);
     }
 }
@@ -256,16 +298,11 @@ DpdkContextGenerator::addMatchAttributes(const IR::P4Table* table, const cstring
     for (auto action : table->getActionList()->actionList) {
         auto* oneAction = new Util::JsonObject();
         struct actionAttributes attr = ::get(actionAttrMap, action->getName());
-        auto actName = toStr(action->expression);
         auto name = action->externalName();
         if (name != "NoAction") {
-            actName = ctrlName + "." + actName;
             name = ctrlName + "." + name;
-        } else {
-            actName = name;
         }
         oneAction->emplace("action_name", name);
-        oneAction->emplace("target_action_name", actName);
         oneAction->emplace("action_handle", attr.actionHandle);
         auto* immFldArray = new Util::JsonArray();
         if (attr.params) {
@@ -314,12 +351,15 @@ const IR::P4Table * table, const cstring controlName, bool isMatch) {
         // Printing compiler added actions is curently not required
         if (!attr.is_compiler_added_action) {
             auto *act = new Util::JsonObject();
-            auto actName = action->externalName();
-
-            // NoAction is not prefixed with control block name
-            if (actName != "NoAction")
+            auto actName = toStr(action->expression);
+            auto name = action->externalName();
+            if (name != "NoAction") {
                 actName = controlName + "." + actName;
-           act->emplace("name", actName);
+            } else {
+                actName = name;
+            }
+           act->emplace("name", attr.externalName);
+           act->emplace("target_name", actName);
            act->emplace("handle", attr.actionHandle);
            if (isMatch) {
                act->emplace("constant_default_action", attr.constant_default_action);
@@ -451,9 +491,27 @@ void DpdkContextGenerator::addMatchTables(Util::JsonArray* tablesJson) {
     }
 }
 
+// Add extern information to the context json
+void DpdkContextGenerator::addExternInfo(Util::JsonArray* externsJson) {
+    for (auto t : externs) {
+        auto externAttr = ::get(externAttrMap, t->name.name);
+        auto* externJson = new Util::JsonObject();
+        externJson->emplace("name", externAttr.externalName);
+        externJson->emplace("target_name", t->name.name);
+        externJson->emplace("type", externAttr.externType);
+        auto* attrJson = new Util::JsonObject();
+        if (externAttr.externType == "Counter") {
+            attrJson->emplace("type", externAttr.counterType);
+        }
+        externJson->emplace("attributes", attrJson);
+        externsJson->append(externJson);
+    }
+}
+
 const Util::JsonObject* DpdkContextGenerator::genContextJsonObject() {
     auto* json = new Util::JsonObject();
     auto* tablesJson = new Util::JsonArray();
+    auto* externsJson = new Util::JsonArray();
     struct TopLevelCtxt tlinfo;
     tlinfo.initTopLevelCtxt(options);
     json->emplace("program_name", tlinfo.progName);
@@ -464,6 +522,8 @@ const Util::JsonObject* DpdkContextGenerator::genContextJsonObject() {
     json->emplace("target", cstring("DPDK"));
     json->emplace("tables", tablesJson);
     addMatchTables(tablesJson);
+    json->emplace("externs", externsJson);
+    addExternInfo(externsJson);
     return json;
 }
 

@@ -936,6 +936,17 @@ TypeInference::checkExternConstructor(const IR::Node* errorPosition,
     methodType = cloneWithFreshTypeVariables(methodType)->to<IR::Type_Method>();
     CHECK_NULL(methodType);
 
+    if (errorPosition->is<IR::ConstructorCallExpression>()) {
+        for (auto m : ext->methods) {
+            if (m->isAbstract) {
+                typeError("%1%: extern type %2% with abstract methods cannot be instantiated"
+                          " using a constructor call; consider using a declaration",
+                          errorPosition, ext);
+                return nullptr;
+            }
+        }
+    }
+
     auto args = new IR::Vector<IR::ArgumentInfo>();
     size_t i = 0;
     for (auto pi : *methodType->parameters->getEnumerator()) {
@@ -1370,6 +1381,12 @@ const IR::Node* TypeInference::postorder(IR::Type_List* type) {
 }
 
 const IR::Node* TypeInference::postorder(IR::Type_Tuple* type) {
+    for (auto field : type->components) {
+        if (field->is<IR::IContainer>()) {
+            typeError("%1%: not supported as a tuple field", field);
+            return type;
+        }
+    }
     (void)setTypeType(type);
     return type;
 }
@@ -1811,17 +1828,13 @@ const IR::Node* TypeInference::postorder(IR::Operation_Relation* expression) {
         return result;
     } else if (ltype->is<IR::Type_InfInt>() && rtype->is<IR::Type_Bits>()) {
         auto e = expression->clone();
-        auto cst = expression->left->to<IR::Constant>();
-        CHECK_NULL(cst);
-        e->left = new IR::Constant(cst->srcInfo, rtype, cst->value, cst->base);
+        e->left = new IR::Cast(e->left->srcInfo, rtype, e->left);
         setType(e->left, rtype);
         ltype = rtype;
         expression = e;
     } else if (rtype->is<IR::Type_InfInt>() && ltype->is<IR::Type_Bits>()) {
         auto e = expression->clone();
-        auto cst = expression->right->to<IR::Constant>();
-        CHECK_NULL(cst);
-        e->right = new IR::Constant(cst->srcInfo, ltype, cst->value, cst->base);
+        e->right = new IR::Cast(e->right->srcInfo, ltype, e->right);
         setType(e->right, ltype);
         rtype = ltype;
         expression = e;
@@ -1837,7 +1850,7 @@ const IR::Node* TypeInference::postorder(IR::Operation_Relation* expression) {
         expression->left = c.left;
         expression->right = c.right;
     } else {
-        if (!ltype->is<IR::Type_Bits>() || !rtype->is<IR::Type_Bits>() || !(ltype == rtype)) {
+        if (!ltype->is<IR::Type_Bits>() || !rtype->is<IR::Type_Bits>() || !(ltype->equiv(*rtype))) {
             typeError("%1%: not defined on %2% and %3%",
                       expression, ltype->toString(), rtype->toString());
             return expression;
@@ -1914,8 +1927,6 @@ const IR::Node* TypeInference::postorder(IR::Key* key) {
     }
     LOG2("Setting key type to " << dbp(keyTuple));
     setType(key, keyTuple);
-    // installing also for the original because we cannot tell which one will survive in the ir
-    LOG2("Setting key type to " << dbp(getOriginal()));
     setType(getOriginal(), keyTuple);
     return key;
 }
@@ -1975,14 +1986,22 @@ const IR::Node* TypeInference::postorder(IR::Entry* entry) {
     auto entryKeyType = getType(entry->keys);
     if (entryKeyType == nullptr)
         return entry;
-    if (entryKeyType->is<IR::Type_Set>())
-        entryKeyType = entryKeyType->to<IR::Type_Set>()->elementType;
+    if (auto ts = entryKeyType->to<IR::Type_Set>())
+        entryKeyType = ts->elementType;
+    if (entry->singleton) {
+        if (auto tl = entryKeyType->to<IR::Type_BaseList>()) {
+            // An entry of _ does not have type Tuple<Type_Dontcare>, but rather Type_Dontcare
+            if (tl->getSize() == 1 && tl->components.at(0)->is<IR::Type_Dontcare>())
+                entryKeyType = tl->components.at(0);
+        }
+    }
 
     auto keyset = entry->getKeys();
     if (keyset == nullptr || !(keyset->is<IR::ListExpression>())) {
         typeError("%1%: key expression must be tuple", keyset);
         return entry;
-    } else if (keyset->components.size() < key->keyElements.size()) {
+    }
+    if (keyset->components.size() < key->keyElements.size()) {
         typeError("%1%: Size of entry keyset must match the table key set size", keyset);
         return entry;
     }
@@ -2009,7 +2028,7 @@ const IR::Node* TypeInference::postorder(IR::Entry* entry) {
 
     if (ks != keyset)
         entry = new IR::Entry(entry->srcInfo, entry->annotations,
-                              ks->to<IR::ListExpression>(), entry->action);
+                              ks->to<IR::ListExpression>(), entry->action, entry->singleton);
 
     auto actionRef = entry->getAction();
     auto ale = validateActionInitializer(actionRef, table);
@@ -2135,7 +2154,7 @@ const IR::Node* TypeInference::postorder(IR::ArrayIndex* expression) {
             }
         }
         type = hst->elementType;
-    } else if (auto tup = ltype->to<IR::Type_Tuple>()) {
+    } else if (auto tup = ltype->to<IR::Type_BaseList>()) {
         if (index < 0) {
             typeError("Tuple index %1% must be constant", expression->right);
             return expression;
@@ -2231,18 +2250,14 @@ const IR::Node* TypeInference::binaryArith(const IR::Operation_Binary* expressio
         }
     } else if (bl == nullptr && br != nullptr) {
         auto e = expression->clone();
-        auto cst = expression->left->to<IR::Constant>();
-        CHECK_NULL(cst);
-        e->left = new IR::Constant(cst->srcInfo, rtype, cst->value, cst->base);
+        e->left = new IR::Cast(e->left->srcInfo, br, e->left);
         setType(e->left, rtype);
         expression = e;
         resultType = rtype;
         setType(expression, resultType);
     } else if (bl != nullptr && br == nullptr) {
         auto e = expression->clone();
-        auto cst = expression->right->to<IR::Constant>();
-        CHECK_NULL(cst);
-        e->right = new IR::Constant(cst->srcInfo, ltype, cst->value, cst->base);
+        e->right = new IR::Cast(e->right->srcInfo, bl, e->right);
         setType(e->right, ltype);
         expression = e;
         resultType = ltype;
@@ -2481,16 +2496,14 @@ const IR::Node* TypeInference::typeSet(const IR::Operation_Binary* expression) {
         }
     } else if (bl == nullptr && br != nullptr) {
         auto e = expression->clone();
-        auto cst = expression->left->to<IR::Constant>();
-        e->left = new IR::Constant(cst->srcInfo, rtype, cst->value, cst->base);
+        e->left = new IR::Cast(e->left->srcInfo, rtype, e->left);
         setCompileTimeConstant(e->left);
         expression = e;
         sameType = rtype;
         setType(e->left, sameType);
     } else if (bl != nullptr && br == nullptr) {
         auto e = expression->clone();
-        auto cst = expression->right->to<IR::Constant>();
-        e->right = new IR::Constant(cst->srcInfo, ltype, cst->value, cst->base);
+        e->right = new IR::Cast(e->right->srcInfo, ltype, e->right);
         setCompileTimeConstant(e->right);
         expression = e;
         setType(e->right, ltype);
@@ -2831,8 +2844,8 @@ const IR::Node* TypeInference::postorder(IR::Slice* expression) {
         return expression;
     }
 
-    auto msb = expression->e1->to<IR::Constant>();
-    auto lsb = expression->e2->to<IR::Constant>();
+    auto msb = expression->e1->checkedTo<IR::Constant>();
+    auto lsb = expression->e2->checkedTo<IR::Constant>();
     if (!msb->fitsInt()) {
         typeError("%1%: bit index too large", msb);
         return expression;
@@ -3767,11 +3780,9 @@ const IR::Node* TypeInference::postorder(IR::SwitchStatement* stat) {
             if (lt == nullptr)
                 continue;
             if (lt->is<IR::Type_InfInt>() && type->is<IR::Type_Bits>()) {
-                auto cst = c->label->to<IR::Constant>();
-                CHECK_NULL(cst);
                 c = new IR::SwitchCase(
                     c->srcInfo,
-                    new IR::Constant(cst->srcInfo, type, cst->value, cst->base), c->statement);
+                    new IR::Cast(c->label->srcInfo, type, c->label), c->statement);
                 setType(c->label, type);
                 setCompileTimeConstant(c->label);
                 continue;
