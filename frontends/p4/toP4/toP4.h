@@ -166,6 +166,10 @@ class ToP4 : public Inspector {
         builder.append(t->toString());
         return false;
     }
+    bool preorder(const IR::Type_SpecializedCanonical* t) override {
+        BUG("%1%: specialized canonical type in IR tree", t);
+        return false;
+    }
 
     // declarations
     bool preorder(const IR::Declaration_Constant* cst) override;
@@ -191,6 +195,7 @@ class ToP4 : public Inspector {
     bool preorder(const IR::SelectExpression* e) override;
     bool preorder(const IR::ListExpression* e) override;
     bool preorder(const IR::StructExpression* e) override;
+    bool preorder(const IR::InvalidHeader* e) override;
     bool preorder(const IR::MethodCallExpression* e) override;
     bool preorder(const IR::DefaultExpression* e) override;
     bool preorder(const IR::This* e) override;
@@ -229,6 +234,7 @@ class ToP4 : public Inspector {
     bool preorder(const IR::Argument* arg) override;
     bool preorder(const IR::Path* p) override;
     bool preorder(const IR::Parameter* p) override;
+    bool preorder(const IR::Annotations* a) override;
     bool preorder(const IR::Annotation* a) override;
     bool preorder(const IR::P4Program* program) override;
     bool preorder(const IR::P4Control* c) override;

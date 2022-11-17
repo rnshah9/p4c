@@ -21,15 +21,10 @@ limitations under the License.
 #include "frontends/common/resolveReferences/referenceMap.h"
 #include "frontends/p4/typeMap.h"
 #include "frontends/p4/parameterSubstitution.h"
-#include "frontends/p4/methodInstance.h"
 
 namespace P4 {
 
-class InstanceBase {
- public:
-    template<typename T> bool is() const { return to<T>() != nullptr; }
-    template<typename T> const T* to() const { return dynamic_cast<const T*>(this); }
-
+class InstanceBase : public ICastable {
  protected:
     virtual ~InstanceBase() {}
 

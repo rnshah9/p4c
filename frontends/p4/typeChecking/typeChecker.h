@@ -109,12 +109,26 @@ class TypeInference : public Transform {
     // This is needed because sometimes we invoke visitors recursively on subtrees explicitly.
     // (visitDagOnce cannot take care of this).
     bool done() const;
+
+    TypeVariableSubstitution* unifyBase(
+        bool allowCasts, const IR::Node* errorPosition, const IR::Type* destType,
+        const IR::Type* srcType,
+        cstring errorFormat, std::initializer_list<const IR::Node*> errorArgs);
+
     /// Unifies two types.  Returns nullptr if unification fails.
     /// Populates the typeMap with values for the type variables.
+    /// This allows an implicit cast from the right type to the left type.
+    TypeVariableSubstitution* unifyCast(
+        const IR::Node* errorPosition, const IR::Type* destType,
+        const IR::Type* srcType,
+        cstring errorFormat = nullptr, std::initializer_list<const IR::Node*> errorArgs = {})
+    { return unifyBase(true, errorPosition, destType, srcType, errorFormat, errorArgs); }
+    /// Same as above, not allowing casts
     TypeVariableSubstitution* unify(
         const IR::Node* errorPosition, const IR::Type* destType,
         const IR::Type* srcType,
-        cstring errorFormat = nullptr, std::initializer_list<const IR::Node*> errorArgs = {});
+        cstring errorFormat = nullptr, std::initializer_list<const IR::Node*> errorArgs = {})
+    { return unifyBase(false, errorPosition, destType, srcType, errorFormat, errorArgs); }
 
     /** Tries to assign sourceExpression to a destination with type destType.
         This may rewrite the sourceExpression, in particular converting InfInt values
@@ -160,10 +174,10 @@ class TypeInference : public Transform {
     const IR::Expression* actionCall(
         bool inActionList,   // if true this "call" is in the action list of a table
         const IR::MethodCallExpression* actionCall);
-    const IR::Vector<IR::Argument>*
-            checkExternConstructor(const IR::Node* errorPosition,
-                                   const IR::Type_Extern* ext,
-                                   const IR::Vector<IR::Argument> *arguments);
+    std::pair<const IR::Type*, const IR::Vector<IR::Argument>*>
+    checkExternConstructor(const IR::Node* errorPosition,
+                           const IR::Type_Extern* ext,
+                           const IR::Vector<IR::Argument> *arguments);
 
     static constexpr bool forbidModules = true;
     static constexpr bool forbidPackages = true;
@@ -171,11 +185,12 @@ class TypeInference : public Transform {
                          bool forbidModules = false, bool forbidPackage = false) const;
     virtual const IR::Type* setTypeType(const IR::Type* type, bool learn = true);
 
+    /// Action list of the current table.
+    const IR::ActionList* currentActionList;
     /// This is used to validate the initializer for the default_action
     /// or for actions in the entries list.  Returns the action list element
     /// on success.
-    const IR::ActionListElement* validateActionInitializer(const IR::Expression* actionCall,
-                                                           const IR::P4Table* table);
+    const IR::ActionListElement* validateActionInitializer(const IR::Expression* actionCall);
 
     //////////////////////////////////////////////////////////////
 
@@ -208,6 +223,7 @@ class TypeInference : public Transform {
     const IR::Node* preorder(IR::Declaration_Instance* decl) override;
     // check invariants for entire list before checking the entries
     const IR::Node* preorder(IR::EntriesList* el) override;
+    const IR::Node* preorder(IR::Type_SerEnum* type) override;
 
     const IR::Node* postorder(IR::Declaration_MatchKind* decl) override;
     const IR::Node* postorder(IR::Declaration_Variable* decl) override;
@@ -225,7 +241,6 @@ class TypeInference : public Transform {
     const IR::Node* postorder(IR::Type_Base* type) override;
     const IR::Node* postorder(IR::Type_Var* type) override;
     const IR::Node* postorder(IR::Type_Enum* type) override;
-    const IR::Node* postorder(IR::Type_SerEnum* type) override;
     const IR::Node* postorder(IR::Type_Extern* type) override;
     const IR::Node* postorder(IR::StructField* field) override;
     const IR::Node* postorder(IR::Type_Header* type) override;
@@ -284,6 +299,7 @@ class TypeInference : public Transform {
     const IR::Node* postorder(IR::Member* expression) override;
     const IR::Node* postorder(IR::TypeNameExpression* expression) override;
     const IR::Node* postorder(IR::ListExpression* expression) override;
+    const IR::Node* postorder(IR::InvalidHeader* expression) override;
     const IR::Node* postorder(IR::StructExpression* expression) override;
     const IR::Node* postorder(IR::MethodCallExpression* expression) override;
     const IR::Node* postorder(IR::ConstructorCallExpression* expression) override;
@@ -291,6 +307,7 @@ class TypeInference : public Transform {
     const IR::Node* postorder(IR::DefaultExpression* expression) override;
     const IR::Node* postorder(IR::This* expression) override;
     const IR::Node* postorder(IR::AttribLocal* local) override;
+    const IR::Node* postorder(IR::ActionList* al) override;
 
     const IR::Node* postorder(IR::ReturnStatement* stat) override;
     const IR::Node* postorder(IR::IfStatement* stat) override;

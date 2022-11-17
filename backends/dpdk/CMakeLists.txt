@@ -24,8 +24,9 @@ set (DPDK_P4RUNTIME_INFO_PROTO ${DPDK_P4RUNTIME_DIR}/p4info.proto)
 set (DPDK_P4RUNTIME_INFO_GEN_SRCS ${P4C_BINARY_DIR}/control-plane/p4/config/dpdk/p4info.pb.cc)
 set (DPDK_P4RUNTIME_INFO_GEN_HDRS ${P4C_BINARY_DIR}/control-plane/p4/config/dpdk/p4info.pb.h)
 # The generated code for protobuf has an excessive number of warnings
+# Silence -Warray-bounds as the root issue is out of our control: https://github.com/protocolbuffers/protobuf/issues/7140
 set_source_files_properties(${DPDK_P4RUNTIME_INFO_GEN_SRCS} PROPERTIES
-  COMPILE_FLAGS "-Wno-unused-parameter")
+  COMPILE_FLAGS "-Wno-unused-parameter -Wno-array-bounds")
 
 add_custom_target (dpdk_runtime_dir
   ${CMAKE_COMMAND} -E make_directory
@@ -98,7 +99,6 @@ foreach(src IN LISTS DPDK_IR_SRCS)
 endforeach()
 set(EXTENSION_FRONTEND_SOURCES ${EXTENSION_FRONTEND_SOURCES} ${QUAL_DPDK_IR_SRCS} PARENT_SCOPE)
 
-add_cpplint_files(${CMAKE_CURRENT_SOURCE_DIR} "${P4C_DPDK_SOURCES};${P4C_DPDK_HEADERS};${DPDK_IR_SRCS}")
 add_executable(p4c-dpdk ${P4C_DPDK_SOURCES})
 target_link_libraries (p4c-dpdk dpdk_runtime ${P4C_LIBRARIES} ${P4C_LIB_DEPS})
 add_dependencies(p4c-dpdk dpdk_runtime genIR frontend)
@@ -116,7 +116,10 @@ set(DPDK_COMPILER_DRIVER "${CMAKE_CURRENT_SOURCE_DIR}/run-dpdk-test.py")
 
 set (P4_16_SUITES
   "${P4C_SOURCE_DIR}/testdata/p4_16_samples/psa-*.p4"
-  "${P4C_SOURCE_DIR}/testdata/p4_16_samples/pna-*.p4")
+  "${P4C_SOURCE_DIR}/testdata/p4_16_samples/pna-*.p4"
+  "${P4C_SOURCE_DIR}/testdata/p4_16_psa_errors/*.p4"
+  "${P4C_SOURCE_DIR}/testdata/p4_16_dpdk_errors/*.p4"
+  "${P4C_SOURCE_DIR}/testdata/p4_16_pna_errors/*.p4")
 p4c_add_tests("dpdk" ${DPDK_COMPILER_DRIVER} "${P4_16_SUITES}" "" "--bfrt")
 
 include(DpdkXfail.cmake)

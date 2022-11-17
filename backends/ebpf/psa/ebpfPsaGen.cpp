@@ -135,8 +135,18 @@ void PSAEbpfGenerator::emitTypes(CodeBuilder *builder) const {
     egress->parser->emitTypes(builder);
     egress->control->emitTableTypes(builder);
     builder->newline();
+    emitCRC32LookupTableTypes(builder);
+    builder->newline();
 }
-
+void PSAEbpfGenerator::emitCRC32LookupTableTypes(CodeBuilder *builder) const {
+    builder->append("struct lookup_tbl_val ");
+    builder->blockStart();
+    builder->emitIndent();
+    builder->append("u32 table[2048]");
+    builder->endOfStatement(true);
+    builder->blockEnd(true);
+    builder->endOfStatement(true);
+}
 void PSAEbpfGenerator::emitGlobalHeadersMetadata(CodeBuilder *builder) const {
     builder->append("struct hdr_md ");
     builder->blockStart();
@@ -197,6 +207,7 @@ void PSAEbpfGenerator::emitInitializer(CodeBuilder *builder) const {
     ingress->control->emitTableInitializers(builder);
     egress->control->emitTableInitializers(builder);
     builder->newline();
+    emitCRC32LookupTableInitializer(builder);
     builder->emitIndent();
     builder->appendLine("return 0;");
     builder->blockEnd(true);
@@ -404,9 +415,93 @@ void PSAArchTC::emitInstances(CodeBuilder *builder) const {
 
     emitPacketReplicationTables(builder);
     emitPipelineInstances(builder);
-
+    emitCRC32LookupTableInstance(builder);
     builder->appendLine("REGISTER_END()");
     builder->newline();
+}
+void PSAArchTC::emitCRC32LookupTableInstance(CodeBuilder *builder) const {
+    builder->target->emitTableDecl(builder, cstring("crc_lookup_tbl"), TableArray, "u32",
+                                   cstring("struct lookup_tbl_val"), 1);
+}
+void PSAEbpfGenerator::emitCRC32LookupTableInitializer(CodeBuilder *builder) const {
+    cstring keyName = "lookup_tbl_key";
+    cstring valueName = "lookup_tbl_value";
+    cstring instanceName = "crc_lookup_tbl";
+
+    builder->emitIndent();
+    builder->appendFormat("u32 %s = 0", keyName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("struct lookup_tbl_val* %s = BPF_MAP_LOOKUP_ELEM(%s, &%s)",
+                          valueName.c_str(), instanceName.c_str(), keyName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("if (%s != NULL)", valueName.c_str());
+    builder->blockStart();
+    builder->emitIndent();
+    builder->appendFormat("for (u16 i = 0; i <= 255; i++)");
+    builder->blockStart();
+    builder->emitIndent();
+    builder->appendFormat("u32 crc = i");
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("for (u16 j = 0; j < 8; j++)");
+    builder->blockStart();
+    builder->emitIndent();
+    builder->appendFormat("crc = (crc >> 1) ^ ((crc & 1) * 3988292384)");
+    builder->endOfStatement(true);
+    builder->blockEnd(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[i] = crc", valueName.c_str());
+    builder->endOfStatement(true);
+    builder->blockEnd(true);
+    builder->emitIndent();
+    builder->appendFormat("for (u16 i = 0; i <= 255; i++)");
+    builder->blockStart();
+    builder->emitIndent();
+    builder->appendFormat("%s->table[256+i] = "
+                          "(%s->table[0+i] >> 8) ^ %s->table[(%s->table[0+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[512+i] = "
+                          "(%s->table[256+i] >> 8) ^ %s->table[(%s->table[256+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[768+i] = "
+                          "(%s->table[512+i] >> 8) ^ %s->table[(%s->table[512+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[1024+i] = "
+                          "(%s->table[768+i] >> 8) ^ %s->table[(%s->table[768+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[1280+i] = "
+                          "(%s->table[1024+i] >> 8) ^ %s->table[(%s->table[1024+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[1536+i] = "
+                          "(%s->table[1280+i] >> 8) ^ %s->table[(%s->table[1280+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->emitIndent();
+    builder->appendFormat("%s->table[1792+i] = "
+                          "(%s->table[1536+i] >> 8) ^ %s->table[(%s->table[1536+i] & 0xFF)]",
+                          valueName.c_str(), valueName.c_str(), valueName.c_str(),
+                          valueName.c_str());
+    builder->endOfStatement(true);
+    builder->blockEnd(true);
+    builder->blockEnd(true);
 }
 
 void PSAArchTC::emitInitializerSection(CodeBuilder *builder) const {
@@ -505,14 +600,14 @@ bool ConvertToEbpfPipeline::preorder(const IR::PackageBlock *block) {
         return false;
     }
 
-    auto parser_converter = new ConvertToEBPFParserPSA(pipeline, refmap, typemap, options, type);
+    auto parser_converter = new ConvertToEBPFParserPSA(pipeline, typemap, type);
     parserBlock->apply(*parser_converter);
     pipeline->parser = parser_converter->getEBPFParser();
     CHECK_NULL(pipeline->parser);
 
     auto control_converter = new ConvertToEBPFControlPSA(pipeline,
                                                          pipeline->parser->headers,
-                                                         refmap, typemap, options, type);
+                                                         refmap, type);
     controlBlock->apply(*control_converter);
     pipeline->control = control_converter->getEBPFControl();
     CHECK_NULL(pipeline->control);
@@ -520,7 +615,7 @@ bool ConvertToEbpfPipeline::preorder(const IR::PackageBlock *block) {
     auto deparser_converter = new ConvertToEBPFDeparserPSA(
             pipeline,
             pipeline->parser->headers, pipeline->control->outputStandardMetadata,
-            refmap, typemap, options, type);
+            typemap, type);
     deparserBlock->apply(*deparser_converter);
     pipeline->deparser = deparser_converter->getEBPFDeparser();
     CHECK_NULL(pipeline->deparser);

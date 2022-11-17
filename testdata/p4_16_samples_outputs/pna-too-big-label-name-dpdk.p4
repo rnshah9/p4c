@@ -1,5 +1,5 @@
 #include <core.p4>
-#include <pna.p4>
+#include <dpdk/pna.p4>
 
 typedef bit<48> EthernetAddress;
 header ethernet_t {
@@ -73,7 +73,7 @@ control MainControlImpl(inout headers_t hdr, inout main_metadata_t user_meta, in
     }
     table ipv4_da_lpm {
         key = {
-            tmpDir: lpm @name("ipv4_addr") ;
+            tmpDir: lpm @name("ipv4_addr");
         }
         actions = {
             next_hop;
@@ -101,4 +101,3 @@ control MainDeparserImpl(packet_out pkt, in headers_t hdr, in main_metadata_t us
 }
 
 PNA_NIC(MainParserImpl(), PreControlImpl(), MainControlImpl(), MainDeparserImpl()) main;
-

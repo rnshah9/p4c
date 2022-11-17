@@ -118,6 +118,8 @@ void FindTypeSpecializations::postorder(const IR::Type_Specialized* type) {
         insert = findContext<IR::Declaration_Variable>();
     if (!insert)
         insert = findContext<IR::Declaration_Instance>();
+    if (!insert)
+        insert = findContext<IR::P4Action>();
     CHECK_NULL(insert);
     specMap->add(type, st, insert);
 }
@@ -165,7 +167,11 @@ const IR::Node* ReplaceTypeUses::postorder(IR::Type_Specialized* type) {
 
 const IR::Node* ReplaceTypeUses::postorder(IR::StructExpression* expression) {
     auto st = getOriginal<IR::StructExpression>()->structType;
-    CHECK_NULL(st);
+    if (!st) {
+        ::error(ErrorType::ERR_TYPE_ERROR, "%1%: could not infer a type for expression; "
+                "please specify it explicitly", expression);
+        return expression;
+    }
     auto spec = st->to<IR::Type_Specialized>();
     if (spec == nullptr)
         return expression;

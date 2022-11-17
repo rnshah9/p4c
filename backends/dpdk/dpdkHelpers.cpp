@@ -338,15 +338,24 @@ bool ConvertStatementToDpdk::preorder(const IR::AssignmentStatement *a) {
                 if (e->method->getName().name == "get") {
                     auto res = structure->csum_map.find(
                         e->object->to<IR::Declaration_Instance>());
-                    cstring intermediate;
+                    cstring intermediate = "";
                     if (res != structure->csum_map.end()) {
                         intermediate = res->second;
+                    } else {
+                        BUG("checksum map does not collect all checksum def.");
                     }
                     i = new IR::DpdkGetChecksumStatement(
                         left, e->object->getName(), intermediate);
                 }
             } else if (e->originalExternType->getName().name == "Meter") {
                 if (e->method->getName().name == "execute") {
+                    ::error(ErrorType::ERR_UNEXPECTED,
+                            "use dpdk specific `dpdk_execute` method, `%1%`"
+                            " not supported by dpdk",
+                            e->method->getName());
+                    return false;
+                }
+                if (e->method->getName().name == "dpdk_execute") {
                     auto argSize = e->expr->arguments->size();
 
                     // DPDK target needs index and packet length as mandatory parameters
@@ -367,6 +376,31 @@ bool ConvertStatementToDpdk::preorder(const IR::AssignmentStatement *a) {
                     }
                     i = new IR::DpdkMeterExecuteStatement(
                          e->object->getName(), index, length, color_in, left);
+                }
+            } else if (e->originalExternType->getName().name == "DirectMeter") {
+                if (e->method->getName().name == "dpdk_execute") {
+                    auto argSize = e->expr->arguments->size();
+
+                    // DPDK target needs packet length as mandatory parameters
+                    if (argSize < 1) {
+                        ::error(ErrorType::ERR_UNEXPECTED, "Expected atleast 1 argument "
+                                "(packet length) for %1%", e->object->getName());
+                        return false;
+                    }
+                    const IR::Expression *color_in = nullptr;
+                    const IR::Expression *length = nullptr;
+                    if (argSize == 1) {
+                        length = e->expr->arguments->at(0)->expression;
+                        color_in = new IR::Constant(1);
+                    } else if (argSize == 2) {
+                        length = e->expr->arguments->at(1)->expression;
+                        color_in = e->expr->arguments->at(0)->expression;
+                    }
+                    auto metaIndex = new IR::Member(new IR::PathExpression(IR::ID("m")),
+                                                    DirectResourceTableEntryIndex);
+                    add_instr(new IR::DpdkGetTableEntryIndex(metaIndex));
+                    i = new IR::DpdkMeterExecuteStatement(
+                         e->object->getName(), metaIndex, length, color_in, left);
                 }
             } else if (e->originalExternType->getName().name == "Register") {
                 if (e->method->getName().name == "read") {
@@ -924,7 +958,7 @@ bool ConvertStatementToDpdk::preorder(const IR::MethodCallStatement *s) {
         if (a->originalExternType->getName().name == "InternetChecksum") {
             auto res =
                 structure->csum_map.find(a->object->to<IR::Declaration_Instance>());
-            cstring intermediate;
+            cstring intermediate = "";
             if (res != structure->csum_map.end()) {
                 intermediate = res->second;
             } else {
@@ -1027,8 +1061,54 @@ bool ConvertStatementToDpdk::preorder(const IR::MethodCallStatement *s) {
                 }
             }
         } else if (a->originalExternType->getName().name == "Meter") {
-            if (a->method->getName().name != "execute") {
-                BUG("Meter function not implemented.");
+            if (a->method->getName().name != "dpdk_execute") {
+                BUG("Meter function %1% not implemented, use dpdk_execute",
+                    a->method->getName());
+            }
+        } else if (a->originalExternType->getName().name == "DirectMeter") {
+            if (a->method->getName().name != "dpdk_execute") {
+                BUG("Direct Meter function %1% not implemented.", a->method->getName().name);
+            }
+        } else if (a->originalExternType->getName().name == "DirectCounter") {
+            auto di = a->object->to<IR::Declaration_Instance>();
+            auto declArgs = di->arguments;
+            unsigned value = 0;
+            auto counter_type = declArgs->at(0)->expression;
+            if (auto c = counter_type->to<IR::Constant>()) value = c->asUnsigned();
+            if (a->method->getName().name == "count") {
+                auto args = a->expr->arguments;
+                if (args->size() > 1) {
+                    ::error(ErrorType::ERR_UNEXPECTED, "Expected at most 1 argument for %1%," \
+                            "provided %2%", a->method->getName(), args->size());
+                } else {
+                    const IR::Expression *incr = nullptr;
+                    auto counter = a->object->getName();
+                    if (args->size() == 1)
+                        incr = args->at(0)->expression;
+                    if (!incr && value > 0) {
+                        ::error(ErrorType::ERR_UNEXPECTED,
+                                "Expected packet length argument for %1% " \
+                                "method of direct counter",
+                                a->method->getName());
+                        return false;
+                    }
+                    auto metaIndex = new IR::Member(new IR::PathExpression(
+                                                    IR::ID("m")), DirectResourceTableEntryIndex);
+                    add_instr(new IR::DpdkGetTableEntryIndex(metaIndex));
+                    if (value == 2) {
+                        add_instr(new IR::DpdkCounterCountStatement(counter+"_packets", metaIndex));
+                        add_instr(new IR::DpdkCounterCountStatement(counter+"_bytes", metaIndex,
+                                                                    incr));
+                    } else {
+                         if (value == 1)
+                             add_instr(new IR::DpdkCounterCountStatement(counter, metaIndex,
+                                                                               incr));
+                         else
+                             add_instr(new IR::DpdkCounterCountStatement(counter, metaIndex));
+                    }
+                }
+            } else {
+                BUG("Direct Counter function %1% not implemented", a->method->getName());
             }
         } else if (a->originalExternType->getName().name == "Counter") {
             auto di = a->object->to<IR::Declaration_Instance>();
@@ -1183,32 +1263,35 @@ bool ConvertStatementToDpdk::preorder(const IR::MethodCallStatement *s) {
                             a->method->name);
                 return false;
             }
-            auto slot_id = a->expr->arguments->at(0)->expression;
-            auto session_id = a->expr->arguments->at(1)->expression;
-            // Frontend rejects programs which have non-constant arguments for mirror_packet()
-            BUG_CHECK(slot_id->is<IR::Constant>(), "Expected a constant for slot_id param of %1%",
-                                                   a->method->name);
-            BUG_CHECK(session_id->is<IR::Constant>(),
-                      "Expected a constant for session_id param of %1%", a->method->name);
-            unsigned value =  session_id->to<IR::Constant>()->asUnsigned();
-            if (value == 0) {
-                ::error(ErrorType::ERR_INVALID,
-                        "Mirror session ID 0 is reserved for use by Architecture");
-                return false;
+            auto slotId = a->expr->arguments->at(0)->expression;
+            auto sessionId = a->expr->arguments->at(1)->expression;
+            // If slot id and session id are not metadata fields, move these to metadata fields
+            // as DPDK expects these parameters to be in metadata
+            if (!isMetadataField(slotId)) {
+                BUG_CHECK(metadataStruct, "Metadata structure missing unexpectedly!");
+                IR::ID slotName(refmap->newName("mirrorSlot"));
+                metadataStruct->fields.push_back(new IR::StructField(slotName, slotId->type));
+                auto slotMember = new IR::Member(new IR::PathExpression("m"), slotName);
+                add_instr(new IR::DpdkMovStatement(slotMember, slotId));
+                slotId = slotMember;
             }
-
-            // Move slot id and session id to metadata fields as DPDK expects these parameters
-            // to be in metadata
-            BUG_CHECK(metadataStruct, "Metadata structure missing unexpectedly!");
-            IR::ID slotName(refmap->newName("mirrorSlot"));
-            IR::ID sessionName(refmap->newName("mirrorSession"));
-            metadataStruct->fields.push_back(new IR::StructField(slotName, slot_id->type));
-            metadataStruct->fields.push_back(new IR::StructField(sessionName, session_id->type));
-            auto slotMember = new IR::Member(new IR::PathExpression("m"), slotName);
-            auto sessionMember = new IR::Member(new IR::PathExpression("m"), sessionName);
-            add_instr(new IR::DpdkMovStatement(slotMember, slot_id));
-            add_instr(new IR::DpdkMovStatement(sessionMember, session_id));
-            add_instr(new IR::DpdkMirrorStatement(slotMember, sessionMember));
+            if (!isMetadataField(sessionId)) {
+                if (sessionId->is<IR::Constant>()) {
+                    unsigned value =  sessionId->to<IR::Constant>()->asUnsigned();
+                    if (value == 0) {
+                        ::error(ErrorType::ERR_INVALID,
+                                "Mirror session ID 0 is reserved for use by Architecture");
+                        return false;
+                    }
+                }
+                BUG_CHECK(metadataStruct, "Metadata structure missing unexpectedly!");
+                IR::ID sessionName(refmap->newName("mirrorSession"));
+                metadataStruct->fields.push_back(new IR::StructField(sessionName, sessionId->type));
+                auto sessionMember = new IR::Member(new IR::PathExpression("m"), sessionName);
+                add_instr(new IR::DpdkMovStatement(sessionMember, sessionId));
+                sessionId = sessionMember;
+            }
+            add_instr(new IR::DpdkMirrorStatement(slotId, sessionId));
         } else if (a->method->name == "recirculate") {
             add_instr(new IR::DpdkRecirculateStatement());
         } else if (a->method->name == "send_to_port") {
@@ -1272,7 +1355,7 @@ bool ConvertStatementToDpdk::preorder(const IR::SwitchStatement *s) {
         label = refmap->newName("label_switch");
         if (tc != nullptr) {
             auto pe = caseLabel->label->checkedTo<IR::PathExpression>();
-            add_instr(new IR::DpdkJmpIfActionRunStatement(label, pe->path->name.name));
+            add_instr(new IR::DpdkJmpIfActionRunStatement(label, pe->path->name));
         } else {
             add_instr(new IR::DpdkJmpEqualStatement(label, s->expression, caseLabel->label));
         }
@@ -1287,7 +1370,7 @@ bool ConvertStatementToDpdk::preorder(const IR::SwitchStatement *s) {
         label = refmap->newName("label_switch");
         if (tc != nullptr) {
             auto pe = s->cases.at(size-1)->label->checkedTo<IR::PathExpression>();
-            add_instr(new IR::DpdkJmpIfActionRunStatement(label, pe->path->name.name));
+            add_instr(new IR::DpdkJmpIfActionRunStatement(label, pe->path->name));
         } else {
             add_instr(new IR::DpdkJmpEqualStatement(label, s->expression,
                                                     s->cases.at(size-1)->label));

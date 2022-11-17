@@ -33,12 +33,12 @@ TypeVariableSubstitution* TypeConstraints::solve() {
     while (!constraints.empty()) {
         auto last = constraints.back();
         constraints.pop_back();
-        bool success = solve(dynamic_cast<const EqualityConstraint*>(last));
+        bool success = solve(last->to<P4::BinaryConstraint>());
         if (!success)
             return nullptr;
     }
     LOG3("Constraint solution:\n" << currentSubstitution);
-    return currentSubstitution;
+    return currentSubstitution->trim();
 }
 
 bool TypeConstraints::isUnifiableTypeVariable(const IR::Type* type) {
@@ -53,7 +53,7 @@ bool TypeConstraints::isUnifiableTypeVariable(const IR::Type* type) {
     return unifiableTypeVariables.count(tv) > 0;
 }
 
-bool TypeConstraints::solve(const EqualityConstraint *constraint) {
+bool TypeConstraints::solve(const BinaryConstraint *constraint) {
     if (isUnifiableTypeVariable(constraint->left)) {
         auto leftTv = constraint->left->to<IR::ITypeVar>();
         if (constraint->left == constraint->right)

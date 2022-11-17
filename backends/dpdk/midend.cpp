@@ -35,15 +35,18 @@ limitations under the License.
 #include "midend/convertEnums.h"
 #include "midend/convertErrors.h"
 #include "midend/copyStructures.h"
+#include "midend/eliminateInvalidHeaders.h"
 #include "midend/eliminateNewtype.h"
 #include "midend/eliminateSerEnums.h"
 #include "midend/eliminateTuples.h"
+#include "midend/eliminateTypedefs.h"
 #include "midend/eliminateSwitch.h"
 #include "midend/expandEmit.h"
 #include "midend/expandLookahead.h"
 #include "midend/fillEnumMap.h"
 #include "midend/flattenHeaders.h"
 #include "midend/flattenInterfaceStructs.h"
+#include "midend/flattenUnions.h"
 #include "midend/hsIndexSimplify.h"
 #include "midend/local_copyprop.h"
 #include "midend/midEndLast.h"
@@ -133,6 +136,7 @@ DpdkMidEnd::DpdkMidEnd(CompilerOptions &options,
                     {"Register", "write"},
                     {"Counter", "count"},
                     {"Meter", "execute"},
+                    {"Meter", "dpdk_execute"},
                     {"Digest", "pack"},
                 };
                 for (auto f : doNotCopyPropList) {
@@ -174,6 +178,7 @@ DpdkMidEnd::DpdkMidEnd(CompilerOptions &options,
             new P4::RemoveMiss(&refMap, &typeMap),
             new P4::EliminateNewtype(&refMap, &typeMap),
             new P4::EliminateSerEnums(&refMap, &typeMap),
+            new P4::EliminateInvalidHeaders(&refMap, &typeMap),
             convertEnums,
             new VisitFunctor([this, convertEnums]() {
                 enumMap = convertEnums->getEnumMapping();
@@ -205,6 +210,8 @@ DpdkMidEnd::DpdkMidEnd(CompilerOptions &options,
             new P4::RemoveSelectBooleans(&refMap, &typeMap),
             new P4::FlattenHeaders(&refMap, &typeMap),
             new P4::FlattenInterfaceStructs(&refMap, &typeMap),
+            new P4::EliminateTypedef(&refMap, &typeMap),
+            new P4::FlattenHeaderUnion(&refMap, &typeMap),
             new P4::SimplifyControlFlow(&refMap, &typeMap),
             new P4::HSIndexSimplifier(&refMap, &typeMap),
             new P4::ParsersUnroll(true, &refMap, &typeMap),

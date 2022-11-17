@@ -55,8 +55,6 @@ control MyIngressControl(inout headers_t hdrs, inout user_meta_data_t meta, in p
         meta.depth7 = (var4_0 == 33s3 && var5_0 == 33s1 ? var2_0 + 5w3 : meta.depth7);
     }
     @name("MyIngressControl.stub") table stub_0 {
-        key = {
-        }
         actions = {
             nonDefAct();
         }
@@ -115,8 +113,5 @@ control MyEgressDeparser(packet_out pkt, out EMPTY a, out EMPTY b, inout EMPTY c
 }
 
 IngressPipeline<headers_t, user_meta_data_t, EMPTY, EMPTY, EMPTY, EMPTY>(MyIngressParser(), MyIngressControl(), MyIngressDeparser()) ip;
-
 EgressPipeline<EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY>(MyEgressParser(), MyEgressControl(), MyEgressDeparser()) ep;
-
 PSA_Switch<headers_t, user_meta_data_t, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY>(ip, PacketReplicationEngine(), ep, BufferingQueueingEngine()) main;
-

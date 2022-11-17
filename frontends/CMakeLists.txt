@@ -130,6 +130,7 @@ set (P4_FRONTEND_HDRS
   p4/specialize.h
   p4/specializeGenericFunctions.h
   p4/specializeGenericTypes.h
+  p4/staticAssert.h
   p4/strengthReduction.h
   p4/structInitializers.h
   p4/switchAddDefault.h
@@ -264,7 +265,6 @@ set (FRONTEND_CPPLINT_FILES
   ${COMMON_FRONTEND_SRCS} ${COMMON_FRONTEND_HDRS}
   ${V1_FRONTEND_SRCS} ${V1_FRONTEND_HDRS}
   ${PARSERS_SRCS} ${PARSERS_HDRS})
-add_cpplint_files (${CMAKE_CURRENT_SOURCE_DIR} "${FRONTEND_CPPLINT_FILES}")
 
 build_unified(FRONTEND_SOURCES)
 build_unified(EXTENSION_FRONTEND_SOURCES)

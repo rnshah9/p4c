@@ -27,7 +27,7 @@ limitations under the License.
 #include "frontends/p4/typeMap.h"
 #include "frontends/p4/unusedDeclarations.h"
 #include "ir/ir.h"
-#include "lib/gmputil.h"
+#include "lib/big_int_util.h"
 #include "lib/json.h"
 #include "dpdkUtils.h"
 
@@ -164,15 +164,6 @@ class RemoveUnusedMetadataFields : public Transform {
     bool isByteSizeField(const IR::Type *field_type);
 };
 
-// This pass validates that the table keys from Metadata struct fit within 64 bytes including any
-// holes between the key fields in metadata.
-class ValidateTableKeys : public Inspector {
- public:
-    ValidateTableKeys() {}
-    bool preorder(const IR::DpdkAsmProgram *p) override;
-    int getFieldSizeBits(const IR::Type *field_type);
-};
-
 // This pass shorten the Identifier length
 class ShortenTokenLength : public Transform {
     ordered_map<cstring, cstring> newNameMap;
@@ -185,16 +176,22 @@ class ShortenTokenLength : public Transform {
     cstring shortenString(cstring str, size_t allowedLength = 60) {
         if (str.size() <= allowedLength)
             return str;
-         auto itr = newNameMap.find(str);
-         if (itr != newNameMap.end())
-             return itr->second;
-         // make sure new string length less or equal allowedLength
-         cstring newStr = str.substr(0, allowedLength - std::to_string(count).size());
-         newStr += std::to_string(count);
-         count++;
-         newNameMap.insert(std::pair<cstring, cstring>(str, newStr));
-         origNameMap.insert(std::pair<cstring, cstring>(newStr, str));
-         return newStr;
+        auto itr = newNameMap.find(str);
+        if (itr != newNameMap.end())
+            return itr->second;
+        // make sure new string length less or equal allowedLength
+        cstring newStr = str.substr(0, allowedLength - std::to_string(count).size());
+        newStr += std::to_string(count);
+        count++;
+        newNameMap.insert(std::pair<cstring, cstring>(str, newStr));
+        origNameMap.insert(std::pair<cstring, cstring>(newStr, str));
+        return newStr;
+    }
+
+    cstring dropSuffixIfNoAction(IR::ID name) {
+        if (name.originalName == "NoAction")
+            return name.originalName;
+         return name.name;
     }
 
  public:
@@ -255,18 +252,59 @@ class ShortenTokenLength : public Transform {
         return g;
     }
 
-    const IR::Node* preorder(IR::Path *p) override {
-        p->name = shortenString(p->name);
-        return p;
+    void shortenParamTypeName(IR::ParameterList& pl) {
+        IR::IndexedVector<IR::Parameter> new_pl;
+        for (auto p : pl.parameters) {
+            auto newType0 = p->type->to<IR::Type_Name>();
+            auto path0 = newType0->path->clone();
+            path0->name = shortenString(path0->name);
+            new_pl.push_back(new IR::Parameter(p->srcInfo, p->name,
+                            p->annotations, p->direction,
+                            new IR::Type_Name(newType0->srcInfo, path0),
+                            p->defaultValue));
+        }
+        pl = IR::ParameterList {new_pl};
     }
 
     const IR::Node* preorder(IR::DpdkAction *a) override {
-        a->name = shortenString(a->name);
+        a->name = shortenString(dropSuffixIfNoAction(a->name));
+        shortenParamTypeName(a->para);
         return a;
+    }
+
+    const IR::Node* preorder(IR::ActionList* al) override {
+        IR::IndexedVector<IR::ActionListElement> new_al;
+        for (auto ale : al->actionList) {
+            auto methodCallExpr = ale->expression->to<IR::MethodCallExpression>();
+            auto pathExpr = methodCallExpr->method->to<IR::PathExpression>();
+            auto path0 = pathExpr->path->clone();
+            path0->name = shortenString(dropSuffixIfNoAction(path0->name));
+            new_al.push_back(new IR::ActionListElement(ale->srcInfo,
+                        ale->annotations,
+                        new IR::MethodCallExpression(methodCallExpr->srcInfo,
+                            methodCallExpr->type,
+                            new IR::PathExpression(pathExpr->srcInfo,
+                                                   pathExpr->type, path0),
+                            methodCallExpr->typeArguments,
+                            methodCallExpr->arguments)));
+        }
+        return new IR::ActionList(al->srcInfo, new_al);
     }
 
     const IR::Node* preorder(IR::DpdkTable *t) override {
         t->name = shortenString(t->name);
+        auto methodCallExpr = t->default_action->to<IR::MethodCallExpression>();
+        auto pathExpr = methodCallExpr->method->to<IR::PathExpression>();
+        auto path0 = pathExpr->path->clone();
+        path0->name = shortenString(dropSuffixIfNoAction(path0->name));
+        t->default_action = new IR::MethodCallExpression(
+                                methodCallExpr->srcInfo,
+                                methodCallExpr->type,
+                                new IR::PathExpression(pathExpr->srcInfo,
+                                                       pathExpr->type,
+                                                       path0),
+                                methodCallExpr->typeArguments,
+                                methodCallExpr->arguments);
         return t;
     }
 
@@ -281,7 +319,7 @@ class ShortenTokenLength : public Transform {
     }
 
     const IR::Node* preorder(IR::DpdkLearnStatement *ls) override {
-        ls->action = shortenString(ls->action);
+        ls->action = shortenString(dropSuffixIfNoAction(ls->action));
         return ls;
     }
 
@@ -299,6 +337,11 @@ class ShortenTokenLength : public Transform {
         ls->label = shortenString(ls->label);
         return ls;
     }
+
+    const IR::Node* preorder(IR::DpdkJmpActionStatement* jas) override {
+        jas->action = shortenString(dropSuffixIfNoAction(jas->action));
+        return jas;
+    }
 };
 
 /// This pass collect use def info by analysing all possible
@@ -313,12 +356,12 @@ class CollectUseDefInfo : public Inspector {
     std::unordered_map<cstring /*member expresion as string */, int> usesInfo;
     std::unordered_map<cstring, int> defInfo;
     std::unordered_map<cstring /*def*/, const IR::Expression* /*use*/> replacementMap;
-    std::set<cstring> dontEliminate;
+    std::unordered_map<cstring, bool> dontEliminate;
 
     explicit CollectUseDefInfo(P4::TypeMap* typeMap) : typeMap(typeMap) {
-        dontEliminate.insert("m.pna_main_output_metadata_output_port");
-        dontEliminate.insert("m.psa_ingress_output_metadata_drop");
-        dontEliminate.insert("m.psa_ingress_output_metadata_egress_port");
+        dontEliminate["m.pna_main_output_metadata_output_port"]=true;
+        dontEliminate["m.psa_ingress_output_metadata_drop"] = true;
+        dontEliminate["m.psa_ingress_output_metadata_egress_port"] = true;
     }
 
     bool preorder(const IR::DpdkJmpCondStatement *b) override {
@@ -329,14 +372,21 @@ class CollectUseDefInfo : public Inspector {
 
     bool preorder(const IR::DpdkLearnStatement *b) override {
         usesInfo[b->timeout->toString()]++;
-        if (b->argument)
+        dontEliminate[b->timeout->toString()] = true;
+        if (b->argument) {
             usesInfo[b->argument->toString()]++;
+            // dpdk expect all action argument to be contiguous starting from first argument
+            // passed to learner action
+            dontEliminate[b->argument->toString()] = true;
+        }
         return false;
     }
 
     bool preorder(const IR::DpdkUnaryStatement *u) override {
         usesInfo[u->src->toString()]++;
         defInfo[u->dst->toString()]++;
+        // do not eliminate the destination
+        dontEliminate[u->dst->toString()] = true;
         return false;
     }
 
@@ -344,6 +394,10 @@ class CollectUseDefInfo : public Inspector {
         usesInfo[b->src1->toString()]++;
         usesInfo[b->src2->toString()]++;
         defInfo[b->dst->toString()]++;
+        // dst and src1 can not be eliminated, because both are same
+        // and dpdk does not allow src1 to be constant
+        dontEliminate[b->dst->toString()] = true;
+        dontEliminate[b->src1->toString()] = true;
         return false;
     }
 
@@ -358,6 +412,15 @@ class CollectUseDefInfo : public Inspector {
         usesInfo[c->src->toString()]++;
         defInfo[c->dst->toString()]++;
         replacementMap[c->dst->toString()] = c->src;
+        return false;
+    }
+
+    bool preorder(const IR::DpdkMirrorStatement *m) override {
+        usesInfo[m->slotId->toString()]++;
+        usesInfo[m->sessionId->toString()]++;
+        // dpdk expect it as metadata struct member
+        dontEliminate[m->slotId->toString()] = true;
+        dontEliminate[m->sessionId->toString()] = true;
         return false;
     }
 
@@ -378,8 +441,11 @@ class CollectUseDefInfo : public Inspector {
                 cstring name = e->header->toString() + "." + f->name.toString();
                 defInfo[name]++;
             }
-        if (e->length)
+        if (e->length) {
             usesInfo[e->length->toString()]++;
+            // dpdk expect length to be metadata struct member
+            dontEliminate[e->length->toString()] = true;
+        }
         return false;
     }
 
@@ -395,43 +461,61 @@ class CollectUseDefInfo : public Inspector {
 
     bool preorder(const IR::DpdkRxStatement* r) override {
         usesInfo[r->port->toString()]++;
+        // always required
+        dontEliminate[r->port->toString()] = true;
         return false;
     }
 
     bool preorder(const IR::DpdkTxStatement* t) override {
         usesInfo[t->port->toString()]++;
+        // always required
+        dontEliminate[t->port->toString()] = true;
         return false;
     }
 
     bool preorder(const IR::DpdkRecircidStatement* t) override {
         usesInfo[t->pass->toString()]++;
+        // uses standard metadata fields
+        dontEliminate[t->pass->toString()] = true;
         return false;
     }
 
     bool preorder(const IR::DpdkRearmStatement* r) override {
-        if (r->timeout)
+        if (r->timeout) {
             usesInfo[r->timeout->toString()]++;
+            // dpdk requires it in metadata struct
+            dontEliminate[r->timeout->toString()] = true;
+        }
         return false;
     }
 
     bool preorder(const IR::DpdkChecksumAddStatement* c) override {
         usesInfo[c->field->toString()]++;
+        // dpdk requires it in metadata struct
+        dontEliminate[c->field->toString()] = true;
         return false;
     }
 
     bool preorder(const IR::DpdkChecksumSubStatement* c) override {
         usesInfo[c->field->toString()]++;
+        // dpdk requires it in metadata struct
+        dontEliminate[c->field->toString()] = true;
         return false;
     }
 
     bool preorder(const IR::DpdkGetHashStatement* c) override {
         usesInfo[c->dst->toString()]++;
+        // dpdk requires it in metadata struct
+        dontEliminate[c->dst->toString()] = true;
         return false;
     }
 
     bool preorder(const IR::DpdkVerifyStatement* v) override {
         usesInfo[v->condition->toString()]++;
         usesInfo[v->error->toString()]++;
+        // dpdk requires it in metadata struct
+        dontEliminate[v->condition->toString()] = true;
+        dontEliminate[v->error->toString()] = true;
         return false;
     }
 
@@ -476,7 +560,7 @@ class CollectUseDefInfo : public Inspector {
         auto keys = t->match_keys;
         if (keys)
         for (auto ke : keys->keyElements) {
-            dontEliminate.insert(ke->expression->toString());
+            dontEliminate[ke->expression->toString()]=true;
         }
         return false;
     }

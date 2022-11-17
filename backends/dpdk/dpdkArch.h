@@ -224,27 +224,26 @@ class InjectJumboStruct : public Transform {
 // into the single metadata struct.
 // This pass has to be applied after CollectMetadataHeaderInfo fills
 // local_metadata_type field in DpdkProgramStructure which is passed to the constructor.
-class InjectOutputPortMetadataField : public Transform {
+class InjectFixedMetadataField : public Transform {
     DpdkProgramStructure *structure;
 
  public:
-    explicit InjectOutputPortMetadataField(DpdkProgramStructure *structure) :
+    explicit InjectFixedMetadataField(DpdkProgramStructure *structure) :
         structure(structure) {}
     const IR::Node *preorder(IR::Type_Struct *s) override;
 };
 
+/// This pass replaces unaligned header fields with aligned header fields
+/// by combining few contiguous header fields and replaces uses with slices
+/// to preserve the behavior
 class AlignHdrMetaField : public Transform {
-    P4::TypeMap* typeMap;
-    P4::ReferenceMap *refMap;
     DpdkProgramStructure *structure;
 
     ordered_map<cstring, struct fieldInfo> field_name_list;
 
  public:
-    AlignHdrMetaField(P4::TypeMap* typeMap,
-                            P4::ReferenceMap *refMap,
-                            DpdkProgramStructure* structure)
-        : typeMap(typeMap), refMap(refMap), structure(structure) {
+    explicit AlignHdrMetaField(DpdkProgramStructure* structure)
+        : structure(structure) {
         CHECK_NULL(structure);
     }
     const IR::Node *preorder(IR::Type_StructLike *st) override;
@@ -261,7 +260,7 @@ struct ByteAlignment : public PassManager {
                         DpdkProgramStructure* structure)
     : typeMap(typeMap), refMap(refMap), structure(structure) {
         CHECK_NULL(structure);
-        passes.push_back(new AlignHdrMetaField(typeMap, refMap, structure));
+        passes.push_back(new AlignHdrMetaField(structure));
         passes.push_back(new P4::ClearTypeMap(typeMap));
         passes.push_back(new P4::TypeChecking(refMap, typeMap, true));
         /* DoRemoveLeftSlices pass converts the slice Member (LHS in assn stm)
@@ -273,16 +272,7 @@ struct ByteAlignment : public PassManager {
 };
 
 class ReplaceHdrMetaField : public Transform {
-    P4::TypeMap* typeMap;
-    P4::ReferenceMap *refMap;
-    DpdkProgramStructure *structure;
  public:
-    ReplaceHdrMetaField(P4::TypeMap* typeMap,
-                            P4::ReferenceMap *refMap,
-                            DpdkProgramStructure* structure)
-        : typeMap(typeMap), refMap(refMap), structure(structure) {
-        CHECK_NULL(structure);
-    }
     const IR::Node* postorder(IR::Type_Struct *st) override;
 };
 
@@ -399,12 +389,11 @@ class ExpressionUnroll : public Inspector {
 class IfStatementUnroll : public Transform {
  private:
     P4::ReferenceMap *refMap;
-    DpdkProgramStructure *structure;
     DeclarationInjector injector;
 
  public:
-    IfStatementUnroll(P4::ReferenceMap* refMap, DpdkProgramStructure *structure) :
-        refMap(refMap), structure(structure) {
+    explicit IfStatementUnroll(P4::ReferenceMap* refMap) :
+        refMap(refMap) {
         setName("IfStatementUnroll");
     }
     const IR::Node *postorder(IR::SwitchStatement *a) override;
@@ -419,7 +408,6 @@ class IfStatementUnroll : public Transform {
  */
 class LogicalExpressionUnroll : public Inspector {
     P4::ReferenceMap* refMap;
-    DpdkProgramStructure *structure;
 
  public:
     IR::IndexedVector<IR::StatOrDecl> stmt;
@@ -434,8 +422,8 @@ class LogicalExpressionUnroll : public Inspector {
             return false;
     }
 
-    LogicalExpressionUnroll(P4::ReferenceMap* refMap, DpdkProgramStructure *structure)
-        : refMap(refMap), structure(structure) {visitDagOnce = false;}
+    explicit LogicalExpressionUnroll(P4::ReferenceMap* refMap)
+        : refMap(refMap) {visitDagOnce = false;}
     bool preorder(const IR::Operation_Unary *a) override;
     bool preorder(const IR::Operation_Binary *a) override;
     bool preorder(const IR::MethodCallExpression *a) override;
@@ -572,19 +560,21 @@ class DismantleMuxExpressions : public Transform {
 class CollectInternetChecksumInstance : public Inspector {
     P4::TypeMap* typeMap;
     DpdkProgramStructure *structure;
+    std::vector<cstring> *csum_vec;
     int index = 0;
 
  public:
-    CollectInternetChecksumInstance(
-            P4::TypeMap *typeMap,
-            DpdkProgramStructure *structure)
-        : typeMap(typeMap), structure(structure) {}
+    CollectInternetChecksumInstance(P4::TypeMap *typeMap,
+             DpdkProgramStructure *structure,
+             std::vector<cstring> *csum_vec)
+             : typeMap(typeMap), structure(structure), csum_vec(csum_vec) {}
     bool preorder(const IR::Declaration_Instance *d) override {
         auto type = typeMap->getType(d, true);
         if (auto extn = type->to<IR::Type_Extern>()) {
             if (extn->name == "InternetChecksum") {
                 std::ostringstream s;
                 s << "state_" << index++;
+                csum_vec->push_back(s.str());
                 structure->csum_map.emplace(d, s.str());
             }
         }
@@ -597,10 +587,12 @@ class CollectInternetChecksumInstance : public Inspector {
 // side(a question related to endianness)
 class InjectInternetChecksumIntermediateValue : public Transform {
     DpdkProgramStructure *structure;
+    std::vector<cstring> *csum_vec;
 
  public:
-    explicit InjectInternetChecksumIntermediateValue(DpdkProgramStructure *structure) :
-        structure(structure) {}
+    InjectInternetChecksumIntermediateValue(DpdkProgramStructure *structure,
+                    std::vector<cstring> *csum_vec) :
+        structure(structure), csum_vec(csum_vec) {}
 
     const IR::Node *postorder(IR::P4Program *p) override {
         auto new_objs = new IR::Vector<IR::Node>;
@@ -608,14 +600,14 @@ class InjectInternetChecksumIntermediateValue : public Transform {
         for (auto obj : p->objects) {
             if (obj->to<IR::Type_Header>() && !inserted) {
                 inserted = true;
-                if (structure->csum_map.size() > 0) {
+                if (csum_vec->size() > 0) {
                     auto fields = new IR::IndexedVector<IR::StructField>;
-                    for (auto kv : structure->csum_map) {
+                    for (auto fld : *csum_vec) {
                         fields->push_back(new IR::StructField(
-                            IR::ID(kv.second), new IR::Type_Bits(16, false)));
+                                          IR::ID(fld), new IR::Type_Bits(16, false)));
                     }
                     new_objs->push_back(
-                        new IR::Type_Header(IR::ID("cksum_state_t"), *fields));
+                    new IR::Type_Header(IR::ID("cksum_state_t"), *fields));
                 }
             }
             new_objs->push_back(obj);
@@ -636,10 +628,11 @@ class InjectInternetChecksumIntermediateValue : public Transform {
 };
 
 class ConvertInternetChecksum : public PassManager {
+  std::vector<cstring> csum_vec;
  public:
     ConvertInternetChecksum(P4::TypeMap *typeMap, DpdkProgramStructure *structure) {
-        passes.push_back(new CollectInternetChecksumInstance(typeMap, structure));
-        passes.push_back(new InjectInternetChecksumIntermediateValue(structure));
+        passes.push_back(new CollectInternetChecksumInstance(typeMap, structure, &csum_vec));
+        passes.push_back(new InjectInternetChecksumIntermediateValue(structure, &csum_vec));
     }
 };
 
@@ -652,7 +645,25 @@ class CollectExternDeclaration : public Inspector {
     explicit CollectExternDeclaration(DpdkProgramStructure *structure) :
         structure(structure) {}
     bool preorder(const IR::Declaration_Instance *d) override {
-        if (auto type = d->type->to<IR::Type_Specialized>()) {
+        if (auto type = d->type->to<IR::Type_Name>()) {
+            auto externTypeName = type->path->name.name;
+            if (externTypeName == "DirectMeter") {
+                if (d->arguments->size() != 1) {
+                    ::error(ErrorType::ERR_EXPECTED,
+                            "%1%: expected type of meter as the only argument", d);
+                } else {
+                    /* Check if the Direct meter is of PACKETS (0) type */
+                    if (d->arguments->at(0)->expression->to<IR::Constant>()->asUnsigned() == 0)
+                        warn(ErrorType::WARN_UNSUPPORTED,
+                             "%1%: Packet metering is not supported."
+                             " Falling back to byte metering.", d);
+                }
+            } else {
+                // unsupported extern type
+                return false;
+            }
+            structure->externDecls.push_back(d);
+        } else if (auto type = d->type->to<IR::Type_Specialized>()) {
             auto externTypeName = type->baseType->path->name.name;
             if (externTypeName == "Meter") {
                 if (d->arguments->size() != 2) {
@@ -669,6 +680,11 @@ class CollectExternDeclaration : public Inspector {
                 if (d->arguments->size() != 2) {
                     ::error(ErrorType::ERR_EXPECTED,
                             "%1%: expected number of counters and type of counter as arguments", d);
+                }
+            } else if (externTypeName == "DirectCounter") {
+                if (d->arguments->size() != 1) {
+                    ::error(ErrorType::ERR_EXPECTED,
+                            "%1%: expected type of counter as the only argument", d);
                 }
             } else if (externTypeName == "Register") {
                 if (d->arguments->size() != 1 && d->arguments->size() != 2) {
@@ -809,9 +825,25 @@ class CollectTableInfo : public Inspector {
 // This pass must be called right before CollectLocalVariables pass as the temporary
 // variables created for holding copy of the table keys are inserted to Metadata by
 // CollectLocalVariables pass.
+struct keyElementInfo {
+    int offsetInMetadata;
+    int size;
+};
+
+struct keyInfo {
+    int numElements;
+    int numExistingMetaFields;
+    bool isLearner;
+    bool isExact;
+    int size;
+    std::vector<struct keyElementInfo *> elements;
+};
+
 class CopyMatchKeysToSingleStruct : public P4::KeySideEffect {
     IR::IndexedVector<IR::Declaration> decls;
     DpdkProgramStructure *structure;
+    bool metaCopyNeeded;
+
  public:
     CopyMatchKeysToSingleStruct(P4::ReferenceMap* refMap, P4::TypeMap* typeMap,
              std::set<const IR::P4Table*>* invokedInKey, DpdkProgramStructure *structure)
@@ -822,6 +854,9 @@ class CopyMatchKeysToSingleStruct : public P4::KeySideEffect {
     const IR::Node* postorder(IR::KeyElement* element) override;
     const IR::Node* doStatement(const IR::Statement* statement,
                                 const IR::Expression* expression) override;
+    struct keyInfo *getKeyInfo(IR::Key* keys);
+    int getFieldSizeBits(const IR::Type *field_type);
+    bool isLearnerTable(const IR::P4Table *t);
 };
 
 /**
@@ -849,7 +884,8 @@ class SplitP4TableCommon : public Transform {
     const IR::Node* postorder(IR::IfStatement*) override;
     const IR::Node* postorder(IR::SwitchStatement*) override;
 
-    std::tuple<const IR::P4Table*, cstring> create_match_table(const IR::P4Table* /* tbl */);
+    std::tuple<const IR::P4Table*, cstring, cstring>
+        create_match_table(const IR::P4Table* /* tbl */);
     const IR::P4Action* create_action(cstring /* actionName */, cstring /* id */, cstring);
     const IR::P4Table* create_member_table(const IR::P4Table*, cstring, cstring);
     const IR::P4Table* create_group_table(const IR::P4Table*, cstring, cstring, cstring, int, int);
@@ -886,7 +922,6 @@ class SplitActionProfileTable : public SplitP4TableCommon {
  * Handle ActionSelector and ActionProfile extern in PSA
  */
 class ConvertActionSelectorAndProfile : public PassManager {
-    DpdkProgramStructure *structure;
  public:
     ConvertActionSelectorAndProfile(P4::ReferenceMap *refMap, P4::TypeMap* typeMap,
                                     DpdkProgramStructure *structure) {
@@ -899,6 +934,58 @@ class ConvertActionSelectorAndProfile : public PassManager {
         passes.emplace_back(new P4::TypeChecking(refMap, typeMap, true));
     }
 };
+
+/* Collect size information from the owner table for direct counter and meter extern objects
+ * and validate some of the constraints on usage of Direct Meter and Direct Counter extern
+ * methods */
+class CollectDirectCounterMeter : public Inspector {
+    P4::ReferenceMap* refMap;
+    P4::TypeMap* typeMap;
+    DpdkProgramStructure* structure;
+    // To validate presence of specified method call for instancename within given action
+    cstring method;
+    cstring instancename;
+    // To validate that same method call for different direct meter/counter instance does not exist
+    // in any action
+    cstring oneInstance;
+    bool methodCallFound;
+    int getTableSize(const IR::P4Table * tbl);
+    bool ifMethodFound(const IR::P4Action *a, cstring method, cstring instancename = "");
+    void checkMethodCallInAction(const P4::ExternMethod *);
+
+ public:
+    static ordered_map<cstring, int> directMeterCounterSizeMap;
+    CollectDirectCounterMeter(P4::ReferenceMap *refMap, P4::TypeMap *typeMap,
+                DpdkProgramStructure* structure) :
+                refMap(refMap), typeMap(typeMap), structure(structure) {
+        setName("CollectDirectCounterMeter");
+        visitDagOnce = false;
+        method = "";
+        instancename = "";
+        oneInstance = "";
+        methodCallFound = false;
+    }
+
+    bool preorder(const IR::MethodCallStatement* mcs) override;
+    bool preorder(const IR::AssignmentStatement* assn) override;
+    bool preorder(const IR::P4Action* a) override;
+    bool preorder(const IR::P4Table* t) override;
+};
+
+class ValidateDirectCounterMeter : public Inspector {
+    P4::ReferenceMap* refMap;
+    P4::TypeMap* typeMap;
+    DpdkProgramStructure* structure;
+    void validateMethodInvocation(P4::ExternMethod *);
+ public:
+    ValidateDirectCounterMeter(P4::ReferenceMap *refMap, P4::TypeMap *typeMap,
+            DpdkProgramStructure* structure) :
+    refMap(refMap), typeMap(typeMap), structure(structure) {}
+
+    void postorder(const IR::AssignmentStatement*) override;
+    void postorder(const IR::MethodCallStatement*) override;
+};
+
 
 class CollectAddOnMissTable : public Inspector {
     P4::ReferenceMap* refMap;
@@ -925,6 +1012,15 @@ class ValidateAddOnMissExterns : public Inspector {
     refMap(refMap), typeMap(typeMap), structure(structure) {}
 
     void postorder(const IR::MethodCallStatement*) override;
+    cstring getDefActionName(const IR::P4Table* t) {
+        auto act = t->getDefaultAction();
+        BUG_CHECK(act != nullptr, "%1%: default action does not exist", t);
+        if (auto mc = act->to<IR::MethodCallExpression>()) {
+            auto method = mc->method->to<IR::PathExpression>();
+            return method->path->name;
+        }
+        return NULL;
+    }
 };
 
 class CollectErrors : public Inspector {

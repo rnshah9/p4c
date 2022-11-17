@@ -30,12 +30,15 @@ limitations under the License.
 #include "midend/compileTimeOps.h"
 #include "midend/complexComparison.h"
 #include "midend/copyStructures.h"
+#include "midend/eliminateInvalidHeaders.h"
 #include "midend/eliminateTuples.h"
 #include "midend/eliminateNewtype.h"
 #include "midend/eliminateSerEnums.h"
 #include "midend/eliminateSwitch.h"
+#include "midend/eliminateTypedefs.h"
 #include "midend/flattenHeaders.h"
 #include "midend/flattenInterfaceStructs.h"
+#include "midend/flattenUnions.h"
 #include "midend/hsIndexSimplify.h"
 #include "midend/replaceSelectRange.h"
 #include "midend/expandEmit.h"
@@ -82,6 +85,7 @@ MidEnd::MidEnd(CompilerOptions& options, std::ostream* outStream) {
         options.ndebug ? new P4::RemoveAssertAssume(&refMap, &typeMap) : nullptr,
         new P4::RemoveMiss(&refMap, &typeMap),
         new P4::EliminateNewtype(&refMap, &typeMap),
+        new P4::EliminateInvalidHeaders(&refMap, &typeMap),
         new P4::EliminateSerEnums(&refMap, &typeMap),
         new P4::SimplifyKey(&refMap, &typeMap,
                             new P4::OrPolicy(
@@ -103,6 +107,8 @@ MidEnd::MidEnd(CompilerOptions& options, std::ostream* outStream) {
         new P4::RemoveSelectBooleans(&refMap, &typeMap),
         new P4::FlattenHeaders(&refMap, &typeMap),
         new P4::FlattenInterfaceStructs(&refMap, &typeMap),
+        new P4::EliminateTypedef(&refMap, &typeMap),
+        new P4::FlattenHeaderUnion(&refMap, &typeMap),
         new P4::ReplaceSelectRange(&refMap, &typeMap),
         new P4::Predication(&refMap),
         new P4::MoveDeclarations(),  // more may have been introduced

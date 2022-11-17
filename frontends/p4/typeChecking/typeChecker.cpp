@@ -206,15 +206,20 @@ void TypeInference::addSubstitutions(const TypeVariableSubstitution* tvs) {
     typeMap->addSubstitutions(tvs);
 }
 
-TypeVariableSubstitution* TypeInference::unify(
-    const IR::Node* errorPosition, const IR::Type* destType, const IR::Type* srcType,
+TypeVariableSubstitution* TypeInference::unifyBase(
+    bool allowCasts, const IR::Node* errorPosition,
+    const IR::Type* destType, const IR::Type* srcType,
     cstring errorFormat, std::initializer_list<const IR::Node*> errorArgs) {
     CHECK_NULL(destType); CHECK_NULL(srcType);
     if (srcType == destType)
         return new TypeVariableSubstitution();
 
+    TypeConstraint* constraint;
     TypeConstraints constraints(typeMap->getSubstitutions(), typeMap);
-    auto constraint = new EqualityConstraint(destType, srcType, errorPosition);
+    if (allowCasts)
+        constraint = new CanBeImplicitlyCastConstraint(destType, srcType, errorPosition);
+    else
+        constraint = new EqualityConstraint(destType, srcType, errorPosition);
     if (!errorFormat.isNullOrEmpty())
         constraint->setError(errorFormat, errorArgs);
     constraints.add(constraint);
@@ -602,6 +607,7 @@ const IR::Type* TypeInference::canonicalize(const IR::Type* type) {
 ///////////////////////////////////// Visitor methods
 
 const IR::Node* TypeInference::preorder(IR::P4Program* program) {
+    currentActionList = nullptr;
     if (typeMap->checkMap(getOriginal()) && readOnly) {
         LOG2("No need to typecheck");
         prune();
@@ -624,6 +630,7 @@ const IR::Node* TypeInference::postorder(IR::Declaration_MatchKind* decl) {
 }
 
 const IR::Node* TypeInference::postorder(IR::P4Table* table) {
+    currentActionList = nullptr;
     if (done()) return table;
     auto type = new IR::Type_Table(table);
     setType(getOriginal(), type);
@@ -690,7 +697,8 @@ const IR::Node* TypeInference::postorder(IR::Declaration_Variable* decl) {
     if (decl->initializer != nullptr) {
         auto init = assignment(decl, type, decl->initializer);
         if (decl->initializer != init) {
-            decl->type = type;
+            auto declType = type->getP4Type();
+            decl->type = declType;
             decl->initializer = init;
             LOG2("Created new declaration " << decl);
         }
@@ -762,10 +770,11 @@ TypeInference::assignment(const IR::Node* errorPosition, const IR::Type* destTyp
     if (initType == nullptr)
         return sourceExpression;
 
-    auto tvs = unify(errorPosition, destType, initType,
-                     "Source expression '%1%' produces a result of type '%2%' which cannot be "
-                     "assigned to a left-value with type '%3%'",
-                     { sourceExpression, initType, destType });
+    auto tvs = unifyCast(
+        errorPosition, destType, initType,
+        "Source expression '%1%' produces a result of type '%2%' which cannot be "
+        "assigned to a left-value with type '%3%'",
+        { sourceExpression, initType, destType });
     if (tvs == nullptr)
         // error already signalled
         return sourceExpression;
@@ -794,6 +803,7 @@ TypeInference::assignment(const IR::Node* errorPosition, const IR::Type* destTyp
     if (auto ts = concreteType->to<IR::Type_StructLike>()) {
         auto si = sourceExpression->to<IR::StructExpression>();
         auto type = destType->getP4Type();
+        setType(type, new IR::Type_Type(destType));
         if (initType->is<IR::Type_UnknownStruct>() ||
             (si != nullptr && initType->is<IR::Type_Struct>())) {
             // Even if the structure is a struct expression with the right type,
@@ -917,24 +927,25 @@ const IR::Node* TypeInference::postorder(IR::Declaration_Constant* decl) {
     return decl;
 }
 
-// Returns new arguments for constructor, which may have inserted casts
-const IR::Vector<IR::Argument> *
+// Returns the type of the constructed object and
+// new arguments for constructor, which may have inserted casts.
+std::pair<const IR::Type*, const IR::Vector<IR::Argument>*>
 TypeInference::checkExternConstructor(const IR::Node* errorPosition,
                                       const IR::Type_Extern* ext,
                                       const IR::Vector<IR::Argument> *arguments) {
-    auto constructor = ext->lookupConstructor(arguments);
+    auto none = std::pair<const IR::Type*, const IR::Vector<IR::Argument>*>(nullptr, nullptr);
+    auto freshExtern = cloneWithFreshTypeVariables(ext)->to<IR::Type_Extern>();
+    auto constructor = freshExtern->lookupConstructor(arguments);
     if (constructor == nullptr) {
         typeError("%1%: type %2% has no matching constructor",
                   errorPosition, ext);
-        return nullptr;
+        return none;
     }
     auto mt = getType(constructor);
     if (mt == nullptr)
-        return nullptr;
+        return none;
     auto methodType = mt->to<IR::Type_Method>();
     BUG_CHECK(methodType != nullptr, "Constructor does not have a method type, but %1%", mt);
-    methodType = cloneWithFreshTypeVariables(methodType)->to<IR::Type_Method>();
-    CHECK_NULL(methodType);
 
     if (errorPosition->is<IR::ConstructorCallExpression>()) {
         for (auto m : ext->methods) {
@@ -942,7 +953,7 @@ TypeInference::checkExternConstructor(const IR::Node* errorPosition,
                 typeError("%1%: extern type %2% with abstract methods cannot be instantiated"
                           " using a constructor call; consider using a declaration",
                           errorPosition, ext);
-                return nullptr;
+                return none;
             }
         }
     }
@@ -960,7 +971,7 @@ TypeInference::checkExternConstructor(const IR::Node* errorPosition,
         auto argType = getType(arg->expression);
         auto paramType = getType(pi);
         if (argType == nullptr || paramType == nullptr)
-            return nullptr;
+            return none;
 
         if (paramType->is<IR::Type_Control>() ||
             paramType->is<IR::Type_Parser>() ||
@@ -973,19 +984,75 @@ TypeInference::checkExternConstructor(const IR::Node* errorPosition,
         args->push_back(argInfo);
     }
 
+    // will always be bound to Type_Void.
     auto rettype = new IR::Type_Var(IR::ID(refMap->newName("R"), "<returned type>"));
     auto callType = new IR::Type_MethodCall(
         errorPosition->srcInfo, new IR::Vector<IR::Type>(), rettype, args);
-    auto tvs = unify(errorPosition, mt, callType,
+    auto tvs = unify(errorPosition, methodType, callType,
                      "Constructor invocation %1% does not match constructor declaration %2%",
                      { callType, constructor });
     BUG_CHECK(tvs != nullptr || ::errorCount(), "Unification failed with no error");
     if (tvs == nullptr)
-        return nullptr;
+        return none;
+
+    LOG2("Constructor type before specialization " << methodType << " with " << tvs);
+    TypeVariableSubstitutionVisitor substVisitor(tvs);
+    substVisitor.setCalledBy(this);
+    auto specMethodType = methodType->apply(substVisitor);
+    LOG2("Constructor type after specialization " << specMethodType);
+    learn(specMethodType, this);
+    auto canon = getType(specMethodType);
+    if (canon == nullptr)
+        return none;
+
+    auto functionType = specMethodType->to<IR::Type_MethodBase>();
+    BUG_CHECK(functionType != nullptr, "Method type is %1%", specMethodType);
+    if (!functionType->is<IR::Type_Method>())
+        BUG("Unexpected type for function %1%", functionType);
 
     ConstantTypeSubstitution cts(tvs, refMap, typeMap, this);
-    auto newArgs = cts.convert(arguments);
-    return newArgs;
+    // Arguments may need to be cast, e.g., list expression to a
+    // header type.
+    auto paramIt = functionType->parameters->begin();
+    auto newArgs = new IR::Vector<IR::Argument>();
+    bool changed = false;
+    for (auto arg : *arguments) {
+        cstring argName = arg->name.name;
+        bool named = !argName.isNullOrEmpty();
+        const IR::Parameter* param;
+
+        if (named) {
+            param = functionType->parameters->getParameter(argName);
+        } else {
+            param = *paramIt;
+        }
+
+        auto newExpr = arg->expression;
+        if (param->direction == IR::Direction::In || param->direction == IR::Direction::None) {
+            // This is like an assignment; may make additional conversions.
+            newExpr = assignment(arg, param->type, arg->expression);
+        } else {
+            // Insert casts for 'int' values.
+            newExpr = cts.convert(newExpr)->to<IR::Expression>();
+       }
+        if (::errorCount() > 0)
+            return none;
+        if (newExpr != arg->expression) {
+            LOG2("Changing method argument to " << newExpr);
+            changed = true;
+            newArgs->push_back(new IR::Argument(arg->srcInfo, arg->name, newExpr));
+        } else {
+            newArgs->push_back(arg);
+        }
+        if (!named)
+            ++paramIt;
+    }
+    if (changed)
+        arguments = newArgs;
+    auto objectType = new IR::Type_Extern(ext->srcInfo, ext->name, methodType->typeParameters,
+                                          freshExtern->methods);
+    learn(objectType, this);
+    return { objectType, arguments };
 }
 
 // Return true on success
@@ -1063,6 +1130,18 @@ const IR::Node* TypeInference::preorder(IR::Declaration_Instance* decl) {
         simpleType = type->to<IR::Type_SpecializedCanonical>()->substituted;
 
     if (auto et = simpleType->to<IR::Type_Extern>()) {
+        auto [newType, newArgs] = checkExternConstructor(decl, et, decl->arguments);
+        if (newArgs == nullptr) {
+            prune();
+            return decl;
+        }
+        // type can be Type_Extern or Type_SpecializedCanonical.  If it is already
+        // specialized, the type arguments were specified explicitly.
+        // Otherwise, we use the type received from checkExternConstructor, which
+        // has substituted the type variables with fresh ones.
+        if (type->is<IR::Type_Extern>())
+            type = newType;
+        decl->arguments = newArgs;
         setType(orig, type);
         setType(decl, type);
 
@@ -1074,14 +1153,6 @@ const IR::Node* TypeInference::preorder(IR::Declaration_Instance* decl) {
             prune();
             return decl;
         }
-
-        auto args = checkExternConstructor(decl, et, decl->arguments);
-        if (args == nullptr) {
-            prune();
-            return decl;
-        }
-        if (args != decl->arguments)
-            decl->arguments = args;
     } else if (simpleType->is<IR::IContainer>()) {
         if (decl->initializer != nullptr) {
             typeError("%1%: initializers only allowed for extern instances", decl->initializer);
@@ -1285,18 +1356,46 @@ const IR::Node* TypeInference::postorder(IR::Type_Package* decl) {
     return decl;
 }
 
+class ContainsType : public Inspector {
+    const IR::Type* contained;
+    const TypeMap* typeMap;
+    const IR::Type* found = nullptr;
+
+    ContainsType(const IR::Type* contained, const TypeMap* typeMap):
+            contained(contained), typeMap(typeMap) {
+        CHECK_NULL(contained); CHECK_NULL(typeMap); }
+
+    bool preorder(const IR::Type* type) override {
+        LOG3("ContainsType " << type);
+        if (typeMap->equivalent(type, contained))
+            found = type;
+        return true;
+    }
+
+ public:
+    static const IR::Type* find(
+        const IR::Type* type, const IR::Type* contained, const TypeMap* typeMap) {
+        ContainsType c(contained, typeMap);
+        LOG3("Checking if " << type << " contains " << contained);
+        type->apply(c);
+        return c.found;
+    }
+};
+
 const IR::Node* TypeInference::postorder(IR::Type_Specialized *type) {
     // Check for recursive type specializations, e.g.,
     // extern e<T> {};  e<e<bit>> x;
-    auto ctx = getContext();
-    while (ctx) {
-        if (auto ts = ctx->node->to<IR::Type_Specialized>()) {
-            if (type->baseType->path->equiv(*ts->baseType->path)) {
-                typeError("%1%: recursive type specialization", type->baseType);
-                return type;
-            }
+    auto baseType = getTypeType(type->baseType);
+    if (!baseType)
+        return type;
+    for (auto arg : *type->arguments) {
+        auto argtype = getTypeType(arg);
+        if (!argtype)
+            return type;
+        if (auto self = ContainsType::find(argtype, baseType, typeMap)) {
+            typeError("%1%: contains self '%2%' as type argument", type->baseType, self);
+            return type;
         }
-        ctx = ctx->parent;
     }
     (void)setTypeType(type);
     return type;
@@ -1351,11 +1450,7 @@ const IR::Node* TypeInference::postorder(IR::Type_Enum* type) {
     return type;
 }
 
-const IR::Node* TypeInference::postorder(IR::Type_SerEnum* type) {
-    if (::errorCount())
-        // If we failed to typecheck a SerEnumMember we do not
-        // want to set the type for the SerEnum either.
-        return type;
+const IR::Node* TypeInference::preorder(IR::Type_SerEnum* type) {
     auto canon = setTypeType(type);
     for (auto e : *type->getDeclarations())
         setType(e->getNode(), canon);
@@ -1397,8 +1492,11 @@ const IR::Node* TypeInference::postorder(IR::Type_Set* type) {
 }
 
 const IR::Node* TypeInference::postorder(IR::SerEnumMember* member) {
-    if (done())
-        return member;
+    /*
+      The type of the member is initially set in the Type_SerEnum preorder visitor.
+      Here we check additional constraints and we may correct the member.
+      if (done()) return member;
+    */
     auto serEnum = findContext<IR::Type_SerEnum>();
     CHECK_NULL(serEnum);
     auto type = getTypeType(serEnum->type);
@@ -1407,9 +1505,9 @@ const IR::Node* TypeInference::postorder(IR::SerEnumMember* member) {
         return member;
     }
     auto exprType = getType(member->value);
-    auto tvs = unify(member, type, exprType,
-                     "Enum member '%1%' has type '%2%' and not the expected type '%2%'",
-                     { member, exprType, type });
+    auto tvs = unifyCast(member, type, exprType,
+                         "Enum member '%1%' has type '%2%' and not the expected type '%3%'",
+                         { member, exprType, type });
     if (tvs == nullptr)
         // error already signalled
         return member;
@@ -1418,6 +1516,8 @@ const IR::Node* TypeInference::postorder(IR::SerEnumMember* member) {
 
     ConstantTypeSubstitution cts(tvs, refMap, typeMap, this);
     member->value = cts.convert(member->value);  // sets type
+    if (!typeMap->getType(member))
+        setType(member, getTypeType(serEnum));
     return member;
 }
 
@@ -1466,7 +1566,8 @@ const IR::Node* TypeInference::postorder(IR::Type_Method* type) {
                 typeError("%1%: illegal return type for method", method->type->returnType);
             if (name == extName) {
                 // This is a constructor.
-                if (method->type->typeParameters != nullptr &&
+                if (this->called_by == nullptr &&  // canonical types violate this rule
+                    method->type->typeParameters != nullptr &&
                     method->type->typeParameters->size() > 0) {
                     typeError("%1%: Constructors cannot have type parameters",
                               method->type->typeParameters);
@@ -1692,14 +1793,18 @@ const IR::Node* TypeInference::postorder(IR::BoolLiteral* expression) {
     return expression;
 }
 
-// Returns nullptr on error
+// Returns false on error
 bool TypeInference::compare(const IR::Node* errorPosition,
                             const IR::Type* ltype,
                             const IR::Type* rtype,
                             Comparison* compare) {
     if (ltype->is<IR::Type_Action>() || rtype->is<IR::Type_Action>()) {
         // Actions return Type_Action instead of void.
-        typeError("%1%: cannot be applied to action results", errorPosition);
+        typeError("%1% and %2% cannot be compared", compare->left, compare->right);
+        return false;
+    }
+    if (ltype->is<IR::Type_Table>() || rtype->is<IR::Type_Table>()) {
+        typeError("%1% and %2%: tables cannot be compared", compare->left, compare->right);
         return false;
     }
 
@@ -1721,6 +1826,11 @@ bool TypeInference::compare(const IR::Node* errorPosition,
             compare->right = cts.convert(compare->right);
         }
         defined = true;
+    } else if (auto se = rtype->to<IR::Type_SerEnum>()) {
+        // This can only happen in a switch statement, other comparisons
+        // eliminate SerEnums before calling here.
+        if (typeMap->equivalent(ltype, se->type))
+            defined = true;
     } else {
         auto ls = ltype->to<IR::Type_UnknownStruct>();
         auto rs = rtype->to<IR::Type_UnknownStruct>();
@@ -1796,8 +1906,8 @@ bool TypeInference::compare(const IR::Node* errorPosition,
     }
 
     if (!defined) {
-        typeError("%1%: not defined on %2% and %3%",
-                  errorPosition, ltype->toString(), rtype->toString());
+        typeError("'%1%' with type '%2%' cannot be compared to '%3%' with type '%4%'",
+                  compare->left, ltype, compare->right, rtype);
         return false;
     }
     return true;
@@ -1940,7 +2050,8 @@ const IR::Node* TypeInference::preorder(IR::EntriesList* el) {
     BUG_CHECK(table != nullptr, "%1% entries not within a table", el);
     const IR::Key* key = table->getKey();
     if (key == nullptr) {
-        typeError("Could not find key for table %1%", table);
+        if (el->size() != 0)
+            typeError("Entries cannot be specified for a table with no key %1%", table);
         prune();
         return el;
     }
@@ -2015,7 +2126,7 @@ const IR::Node* TypeInference::postorder(IR::Entry* entry) {
     if (nonConstantKeys)
         return entry;
 
-    TypeVariableSubstitution *tvs = unify(
+    TypeVariableSubstitution *tvs = unifyCast(
         entry, keyTuple, entryKeyType,
         "Table entry has type '%1%' which is not the expected type '%2%'",
         { keyTuple, entryKeyType });
@@ -2031,7 +2142,7 @@ const IR::Node* TypeInference::postorder(IR::Entry* entry) {
                               ks->to<IR::ListExpression>(), entry->action, entry->singleton);
 
     auto actionRef = entry->getAction();
-    auto ale = validateActionInitializer(actionRef, table);
+    auto ale = validateActionInitializer(actionRef);
     if (ale != nullptr) {
         auto anno = ale->getAnnotation(IR::Annotation::defaultOnlyAnnotation);
         if (anno != nullptr) {
@@ -2066,6 +2177,29 @@ const IR::Node* TypeInference::postorder(IR::ListExpression* expression) {
         setCompileTimeConstant(expression);
         setCompileTimeConstant(getOriginal<IR::Expression>());
     }
+    return expression;
+}
+
+const IR::Node* TypeInference::postorder(IR::InvalidHeader* expression) {
+    if (done()) return expression;
+    if (!expression->headerType) {
+        // This expression should be enclosed within a cast.
+        // Processing the cast will replace this expression with an
+        // InvalidHeader expression with a known type.
+        setType(expression, IR::Type_Unknown::get());
+        setType(getOriginal(), IR::Type_Unknown::get());
+        return expression;
+    }
+    auto type = getTypeType(expression->headerType);
+    if (!type->is<IR::Type_Header>()) {
+        typeError("%1%: invalid header expression has a non-header type `%2%`",
+                  expression, type);
+        return expression;
+    }
+    setType(getOriginal(), type);
+    setType(expression, type);
+    setCompileTimeConstant(expression);
+    setCompileTimeConstant(getOriginal<IR::Expression>());
     return expression;
 }
 
@@ -2665,6 +2799,10 @@ const IR::Node* TypeInference::postorder(IR::Cast* expression) {
                     se->srcInfo, type, se->components);
                 auto result = postorder(sie);  // may insert casts
                 setType(result, st);
+                if (isCompileTimeConstant(se)) {
+                    setCompileTimeConstant(result->to<IR::Expression>());
+                    setCompileTimeConstant(getOriginal<IR::Expression>());
+                }
                 return result;
             } else {
                 typeError("%1%: cast not supported", expression->destType);
@@ -2672,11 +2810,14 @@ const IR::Node* TypeInference::postorder(IR::Cast* expression) {
             }
         } else if (auto le = expression->expr->to<IR::ListExpression>()) {
             if (st->fields.size() == le->size()) {
+                bool isConstant = true;
                 IR::IndexedVector<IR::NamedExpression> vec;
                 for (size_t i = 0; i < st->fields.size(); i++) {
                     auto fieldI = st->fields.at(i);
                     auto compI = le->components.at(i);
                     auto src = assignment(expression, fieldI->type, compI);
+                    if (!isCompileTimeConstant(src))
+                        isConstant = false;
                     vec.push_back(new IR::NamedExpression(fieldI->name, src));
                 }
                 auto setype = castType->getP4Type();
@@ -2684,11 +2825,28 @@ const IR::Node* TypeInference::postorder(IR::Cast* expression) {
                 auto result = new IR::StructExpression(
                     le->srcInfo, setype, setype, vec);
                 setType(result, st);
+                if (isConstant) {
+                    setCompileTimeConstant(result);
+                    setCompileTimeConstant(getOriginal<IR::Expression>());
+                }
                 return result;
             } else {
                 typeError("%1%: destination type expects %2% fields, but source only has %3%",
                           expression, st->fields.size(), le->components.size());
                 return expression;
+            }
+        } else if (auto ih = expression->expr->to<IR::InvalidHeader>()) {
+            if (!ih->headerType) {
+                auto type = castType->getP4Type();
+                if (!castType->is<IR::Type_Header>()) {
+                    typeError("%1%: invalid header expression has a non-header type `%2%`",
+                              expression, castType);
+                    return expression;
+                }
+                setType(type, new IR::Type_Type(castType));
+                auto result = new IR::InvalidHeader(ih->srcInfo, type, type);
+                setType(result, castType);
+                return result;
             }
         }
     }
@@ -3087,8 +3245,9 @@ const IR::Node* TypeInference::postorder(IR::Member* expression) {
         if (member == IR::Type_Stack::next ||
             member == IR::Type_Stack::last) {
             if (parser == nullptr) {
-                typeError("%1%: 'last' and 'next' for stacks can only be used in a parser",
-                          expression);
+                typeError(
+                    "%1%: 'last', and 'next' for stacks can only be used in a parser",
+                    expression);
                 return expression;
             }
             auto stack = type->to<IR::Type_Stack>();
@@ -3104,6 +3263,12 @@ const IR::Node* TypeInference::postorder(IR::Member* expression) {
             setType(expression, IR::Type_Bits::get(32));
             return expression;
         } else if (member == IR::Type_Stack::lastIndex) {
+            if (parser == nullptr) {
+                typeError(
+                    "%1%: 'lastIndex' for stacks can only be used in a parser",
+                    expression);
+                return expression;
+            }
             setType(getOriginal(), IR::Type_Bits::get(32, false));
             setType(expression, IR::Type_Bits::get(32, false));
             return expression;
@@ -3180,9 +3345,16 @@ TypeInference::actionCall(bool inActionList,
     BUG_CHECK(method->is<IR::PathExpression>(), "%1%: unexpected call", method);
     BUG_CHECK(baseType->returnType == nullptr,
               "%1%: action with return type?", baseType->returnType);
-    if (!baseType->typeParameters->empty())
-        typeError("%1%: Cannot supply type parameters for an action invocation",
+    if (!baseType->typeParameters->empty()) {
+        typeError("%1%: Actions cannot be generic",
                   baseType->typeParameters);
+        return actionCall;
+    }
+    if (!actionCall->typeArguments->empty()) {
+        typeError("%1%: Cannot supply type parameters for an action invocation",
+                  actionCall->typeArguments);
+        return actionCall;
+    }
 
     bool inTable = findContext<IR::P4Table>() != nullptr;
 
@@ -3195,10 +3367,13 @@ TypeInference::actionCall(bool inActionList,
         left.emplace(p->name, p);
 
     auto paramIt = baseType->parameters->parameters.begin();
+    auto newArgs = new IR::Vector<IR::Argument>();
+    bool changed = false;
     for (auto arg : *actionCall->arguments) {
         cstring argName = arg->name.name;
         bool named = !argName.isNullOrEmpty();
         const IR::Parameter* param;
+        auto newExpr = arg->expression;
 
         if (named) {
             param = baseType->parameters->getParameter(argName);
@@ -3216,7 +3391,7 @@ TypeInference::actionCall(bool inActionList,
 
         LOG2("Action parameter " << dbp(param));
         auto leftIt = left.find(param->name.name);
-        // This shold have been checked by the CheckNamedArgs pass.
+        // This should have been checked by the CheckNamedArgs pass.
         BUG_CHECK(leftIt != left.end(), "%1%: Duplicate argument name?", param->name);
         left.erase(leftIt);
 
@@ -3245,10 +3420,26 @@ TypeInference::actionCall(bool inActionList,
                    param->direction == IR::Direction::InOut) {
             if (!isLeftValue(arg->expression))
                 typeError("%1%: must be a left-value", arg->expression);
+        } else {
+            // This is like an assignment; may make additional conversions.
+            newExpr = assignment(arg, param->type, arg->expression);
+        }
+        if (::errorCount() > 0)
+            return actionCall;
+        if (newExpr != arg->expression) {
+            LOG2("Changing action argument to " << newExpr);
+            changed = true;
+            newArgs->push_back(new IR::Argument(arg->srcInfo, arg->name, newExpr));
+        } else {
+            newArgs->push_back(arg);
         }
         if (!named)
             ++paramIt;
     }
+    if (changed)
+        actionCall = new IR::MethodCallExpression(
+            actionCall->srcInfo, actionCall->type, actionCall->method,
+            actionCall->typeArguments, newArgs);
 
     // Check remaining parameters: they must be all non-directional
     bool error = false;
@@ -3267,7 +3458,7 @@ TypeInference::actionCall(bool inActionList,
     setType(getOriginal(), resultType);
     setType(actionCall, resultType);
     auto tvs = constraints.solve();
-    if (tvs == nullptr)
+    if (tvs == nullptr || errorCount() > 0)
         return actionCall;
     addSubstitutions(tvs);
 
@@ -3550,31 +3741,28 @@ const IR::Node* TypeInference::postorder(IR::ConstructorCallExpression* expressi
         simpleType = type->to<IR::Type_SpecializedCanonical>()->substituted;
 
     if (simpleType->is<IR::Type_Extern>()) {
-        auto args = checkExternConstructor(expression, simpleType->to<IR::Type_Extern>(),
-                                           expression->arguments);
-        if (args == nullptr)
+        auto [contType, newArgs] = checkExternConstructor(
+            expression, simpleType->to<IR::Type_Extern>(), expression->arguments);
+        if (newArgs == nullptr)
             return expression;
-        if (args != expression->arguments)
-            expression = new IR::ConstructorCallExpression(expression->srcInfo,
-                                                           expression->constructedType, args);
-        setType(getOriginal(), type);
-        setType(expression, type);
+        expression->arguments = newArgs;
+        setType(getOriginal(), contType);
+        setType(expression, contType);
     } else if (simpleType->is<IR::IContainer>()) {
         auto typeAndArgs = containerInstantiation(expression, expression->arguments,
                                                   simpleType->to<IR::IContainer>());
-        auto conttype = typeAndArgs.first;
+        auto contType = typeAndArgs.first;
         auto args = typeAndArgs.second;
-        if (conttype == nullptr || args == nullptr)
+        if (contType == nullptr || args == nullptr)
             return expression;
         if (type->is<IR::Type_SpecializedCanonical>()) {
             auto st = type->to<IR::Type_SpecializedCanonical>();
-            conttype = new IR::Type_SpecializedCanonical(
-                type->srcInfo, st->baseType, st->arguments, conttype);
+            contType = new IR::Type_SpecializedCanonical(
+                type->srcInfo, st->baseType, st->arguments, contType);
         }
-        if (args != expression->arguments)
-            expression->arguments = args;
-        setType(expression, conttype);
-        setType(getOriginal(), conttype);
+        expression->arguments = args;
+        setType(expression, contType);
+        setType(getOriginal(), contType);
     } else {
         typeError("%1%: Cannot invoke a constructor on type %2%",
                   expression, type->toString());
@@ -3624,7 +3812,7 @@ TypeInference::matchCase(const IR::SelectExpression* select, const IR::Type_Base
         }
         useSelType = selectType->components.at(0);
     }
-    auto tvs = unify(
+    auto tvs = unifyCast(
         select, useSelType, caseType,
         "'match' case label '%1%' has type '%2%' which does not match the expected type '%3%'",
         { selectCase->keyset, caseType, useSelType });
@@ -3752,18 +3940,27 @@ const IR::Node* TypeInference::postorder(IR::SwitchStatement* stat) {
 
     if (auto ae = type->to<IR::Type_ActionEnum>()) {
         // switch (table.apply(...))
-        std::set<cstring> foundLabels;
+        std::map<cstring, const IR::Node*> foundLabels;
+        const IR::Node* foundDefault = nullptr;
         for (auto c : stat->cases) {
-            if (c->label->is<IR::DefaultExpression>())
+            if (c->label->is<IR::DefaultExpression>()) {
+                if (foundDefault)
+                    typeError("%1%: multiple 'default' labels %2%", c->label, foundDefault);
+                foundDefault = c->label;
                 continue;
-            auto pe = c->label->to<IR::PathExpression>();
-            CHECK_NULL(pe);
-            cstring label = pe->path->name.name;
-            if (foundLabels.find(label) != foundLabels.end())
-                typeError("%1%: duplicate switch label", c->label);
-            foundLabels.emplace(label);
-            if (!ae->contains(label))
-                typeError("%1% is not a legal label (action name)", c->label);
+            } else if (auto pe = c->label->to<IR::PathExpression>()) {
+                cstring label = pe->path->name.name;
+                auto it = foundLabels.find(label);
+                if (it != foundLabels.end())
+                    typeError("%1%: 'switch' label duplicates %2%", c->label,
+                              it->second);
+                foundLabels.emplace(label, c->label);
+                if (!ae->contains(label))
+                    typeError("%1% is not a legal label (action name)", c->label);
+            } else {
+                typeError("%1%: 'switch' label must be an action name or 'default'",
+                          c->label);
+            }
         }
     } else {
         // switch (expression)
@@ -3891,13 +4088,24 @@ const IR::Node* TypeInference::postorder(IR::KeyElement* elem) {
     return elem;
 }
 
-const IR::ActionListElement* TypeInference::validateActionInitializer(
-    const IR::Expression* actionCall,
-    const IR::P4Table* table) {
+const IR::Node* TypeInference::postorder(IR::ActionList* al) {
+    LOG3("TI Visited " << dbp(al));
+    BUG_CHECK(currentActionList == nullptr, "%1%: nested action list?", al);
+    currentActionList = al;
+    return al;
+}
 
-    auto al = table->getActionList();
+const IR::ActionListElement* TypeInference::validateActionInitializer(
+    const IR::Expression* actionCall) {
+
+    // We cannot retrieve the action list from the table, because the
+    // table has not been modified yet.  We want the latest version of
+    // the action list, as it has been already typechecked.
+    auto al = currentActionList;
     if (al == nullptr) {
-        typeError("%1% has no action list, so it cannot have %2%",
+        auto table = findContext<IR::P4Table>();
+        BUG_CHECK(table, "%1%: not within a table", actionCall);
+        typeError("%1% has no action list, so it cannot invoke '%2%'",
                   table, actionCall);
         return nullptr;
     }
@@ -3997,12 +4205,10 @@ const IR::Node* TypeInference::postorder(IR::Property* prop) {
                 return prop;
             }
 
-            auto table = findContext<IR::P4Table>();
-            BUG_CHECK(table != nullptr, "%1%: property not within a table?", prop);
             // Check that the default action appears in the list of actions.
             BUG_CHECK(prop->value->is<IR::ExpressionValue>(), "%1% not an expression", prop);
             auto def = prop->value->to<IR::ExpressionValue>()->expression;
-            auto ale = validateActionInitializer(def, table);
+            auto ale = validateActionInitializer(def);
             if (ale != nullptr) {
                 auto anno = ale->getAnnotation(IR::Annotation::tableOnlyAnnotation);
                 if (anno != nullptr) {
